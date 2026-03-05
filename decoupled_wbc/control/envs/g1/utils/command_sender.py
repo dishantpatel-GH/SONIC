@@ -144,3 +144,15 @@ class HandCommandSender:
             self.cmd.motor_cmd[i].kd = self.kd[i]
 
         self.cmd_pub.Write(self.cmd)
+
+
+from decoupled_wbc.control.envs.g1.utils.inspire_driver import InspireHandDriver
+
+
+class InspireHandCommandSender:
+    def __init__(self, is_left: bool = True):
+        self.is_left = is_left
+        self.driver = InspireHandDriver()
+
+    def send_command(self, cmd: np.ndarray):
+        self.driver.set_hand_cmd(self.is_left, cmd)

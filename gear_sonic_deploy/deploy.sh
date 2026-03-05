@@ -211,7 +211,7 @@ show_usage() {
     echo "  --input-type TYPE       Set the input type (default: zmq_manager)"
     echo "  --output-type TYPE      Set the output type (default: ros2)"
     echo "  --zmq-host HOST         Set the ZMQ host (default: localhost)"
-    echo "  --no-hands              Disable Dex3 hand DDS channels (robot has no hands)"
+    echo "  --no-hands              Disable Inspire hand DDS channels (robot has no hands)"
     echo ""
     echo "Interface modes:"
     echo "  sim              Use loopback interface for simulation (MuJoCo)"

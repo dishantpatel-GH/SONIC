@@ -4,8 +4,8 @@ import gymnasium as gym
 import numpy as np
 
 from decoupled_wbc.control.base.env import Env
-from decoupled_wbc.control.envs.g1.utils.command_sender import HandCommandSender
-from decoupled_wbc.control.envs.g1.utils.state_processor import HandStateProcessor
+from decoupled_wbc.control.envs.g1.utils.command_sender import HandCommandSender, InspireHandCommandSender
+from decoupled_wbc.control.envs.g1.utils.state_processor import HandStateProcessor, InspireHandStateProcessor
 
 
 class G1ThreeFingerHand(Env):
@@ -87,3 +87,55 @@ class G1ThreeFingerHand(Env):
         # done calibrating, set target to zero
         self.hand_q_target = np.zeros_like(hand_q)
         self.queue_action({"hand_q": self.hand_q_target})
+
+
+class G1InspireHand(Env):
+    """Hand environment for Inspire hands (6 active DOF, 7-element buffer for pipeline compatibility)."""
+    def __init__(self, is_left: bool = True):
+        super().__init__()
+        self.is_left = is_left
+        self.hand_state_processor = InspireHandStateProcessor(is_left=self.is_left)
+        self.hand_command_sender = InspireHandCommandSender(is_left=self.is_left)
+        self.hand_q_offset = np.zeros(7)
+
+    def observe(self) -> dict[str, any]:
+        hand_state = self.hand_state_processor._prepare_low_state()
+        if hand_state is None:
+            return {
+                "hand_q": np.zeros(7),
+                "hand_dq": np.zeros(7),
+                "hand_ddq": np.zeros(7),
+                "hand_tau_est": np.zeros(7),
+            }
+        assert hand_state.shape[1] >= 28
+        hand_q = hand_state[0, :7]
+        hand_dq = hand_state[0, 7:14]
+        hand_ddq = hand_state[0, 21:28]
+        hand_tau_est = hand_state[0, 14:21]
+        return {
+            "hand_q": hand_q,
+            "hand_dq": hand_dq,
+            "hand_ddq": hand_ddq,
+            "hand_tau_est": hand_tau_est,
+        }
+
+    def queue_action(self, action: dict[str, any]):
+        hand_q = action.get("hand_q", np.zeros(7))
+        hand_q = hand_q - self.hand_q_offset
+        self.hand_command_sender.send_command(hand_q)
+
+    def observation_space(self) -> gym.Space:
+        return gym.spaces.Dict(
+            {
+                "hand_q": gym.spaces.Box(low=-np.inf, high=np.inf, shape=(7,)),
+                "hand_dq": gym.spaces.Box(low=-np.inf, high=np.inf, shape=(7,)),
+                "hand_ddq": gym.spaces.Box(low=-np.inf, high=np.inf, shape=(7,)),
+                "hand_tau_est": gym.spaces.Box(low=-np.inf, high=np.inf, shape=(7,)),
+            }
+        )
+
+    def action_space(self) -> gym.Space:
+        return gym.spaces.Dict({"hand_q": gym.spaces.Box(low=-np.inf, high=np.inf, shape=(7,))})
+
+    def calibrate_hand(self):
+        print("[G1InspireHand] Calibration not implemented; skipping.")

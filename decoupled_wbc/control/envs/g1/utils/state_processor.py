@@ -141,3 +141,43 @@ class HandStateProcessor:
             .reshape(1, -1)
         )
         return state_data
+
+
+from decoupled_wbc.control.envs.g1.utils.inspire_driver import InspireHandDriver
+
+
+class InspireHandStateProcessor:
+    def __init__(self, is_left: bool = True):
+        self.is_left = is_left
+        self.driver = InspireHandDriver()
+        self.active_dof = 6
+        self.pad_dof = 7
+
+    def _prepare_low_state(self) -> np.ndarray:
+        q, dq, tau = self.driver.get_hand_state(self.is_left)
+
+        def pad(arr):
+            res = np.zeros(self.pad_dof)
+            limit = min(len(arr), self.pad_dof)
+            res[:limit] = arr[:limit]
+            return res
+
+        q_pad = pad(q)
+        dq_pad = pad(dq)
+        tau_pad = pad(tau)
+        ddq_pad = np.zeros(self.pad_dof)
+
+        state_data = (
+            np.concatenate(
+                [
+                    q_pad,
+                    dq_pad,
+                    tau_pad,
+                    ddq_pad,
+                ],
+                axis=0,
+            )
+            .astype(np.float64)
+            .reshape(1, -1)
+        )
+        return state_data

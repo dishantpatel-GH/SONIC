@@ -147,9 +147,9 @@ class DefaultEnv:
                 ]
             ):
                 self.body_joint_index.append(i)
-            elif "left_hand" in name:
+            elif name.startswith("L_") and "proximal" in name:
                 self.left_hand_index.append(i)
-            elif "right_hand" in name:
+            elif name.startswith("R_") and "proximal" in name:
                 self.right_hand_index.append(i)
 
         assert len(self.body_joint_index) == self.config["NUM_JOINTS"]
@@ -159,6 +159,14 @@ class DefaultEnv:
         self.body_joint_index = np.array(self.body_joint_index)
         self.left_hand_index = np.array(self.left_hand_index)
         self.right_hand_index = np.array(self.right_hand_index)
+
+        joint_to_actuator = {}
+        for a in range(self.mj_model.nu):
+            jnt_id = self.mj_model.actuator_trnid[a, 0]
+            joint_to_actuator[jnt_id] = a
+        self.body_actuator_index = np.array([joint_to_actuator[j] for j in self.body_joint_index])
+        self.left_hand_actuator_index = np.array([joint_to_actuator[j] for j in self.left_hand_index])
+        self.right_hand_actuator_index = np.array([joint_to_actuator[j] for j in self.right_hand_index])
 
     def init_renderers(self):
         # Initialize camera renderers
@@ -263,16 +271,16 @@ class DefaultEnv:
         obs["body_q"] = self.mj_data.qpos[self.body_joint_index + 7 - 1]
         obs["body_dq"] = self.mj_data.qvel[self.body_joint_index + 6 - 1]
         obs["body_ddq"] = self.mj_data.qacc[self.body_joint_index + 6 - 1]
-        obs["body_tau_est"] = self.mj_data.actuator_force[self.body_joint_index - 1]
+        obs["body_tau_est"] = self.mj_data.actuator_force[self.body_actuator_index]
         if self.num_hand_dof > 0:
             obs["left_hand_q"] = self.mj_data.qpos[self.left_hand_index + 7 - 1]
             obs["left_hand_dq"] = self.mj_data.qvel[self.left_hand_index + 6 - 1]
             obs["left_hand_ddq"] = self.mj_data.qacc[self.left_hand_index + 6 - 1]
-            obs["left_hand_tau_est"] = self.mj_data.actuator_force[self.left_hand_index - 1]
+            obs["left_hand_tau_est"] = self.mj_data.actuator_force[self.left_hand_actuator_index]
             obs["right_hand_q"] = self.mj_data.qpos[self.right_hand_index + 7 - 1]
             obs["right_hand_dq"] = self.mj_data.qvel[self.right_hand_index + 6 - 1]
             obs["right_hand_ddq"] = self.mj_data.qacc[self.right_hand_index + 6 - 1]
-            obs["right_hand_tau_est"] = self.mj_data.actuator_force[self.right_hand_index - 1]
+            obs["right_hand_tau_est"] = self.mj_data.actuator_force[self.right_hand_actuator_index]
         obs["time"] = self.mj_data.time
         return obs
 
@@ -312,10 +320,10 @@ class DefaultEnv:
                 self.mj_data.xfrc_applied[self.band_attached_link] = np.zeros(6)
         body_torques = self.compute_body_torques()
         hand_torques = self.compute_hand_torques()
-        self.torques[self.body_joint_index - 1] = body_torques
+        self.torques[self.body_actuator_index] = body_torques
         if self.num_hand_dof > 0:
-            self.torques[self.left_hand_index - 1] = hand_torques[: self.num_hand_dof]
-            self.torques[self.right_hand_index - 1] = hand_torques[self.num_hand_dof :]
+            self.torques[self.left_hand_actuator_index] = hand_torques[: self.num_hand_dof]
+            self.torques[self.right_hand_actuator_index] = hand_torques[self.num_hand_dof :]
 
         self.torques = np.clip(self.torques, -self.torque_limit, self.torque_limit)
 

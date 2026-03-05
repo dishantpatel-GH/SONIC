@@ -77,12 +77,12 @@ except ImportError:
     xrt = None
 
 try:
-    from gear_sonic.utils.teleop.solver.hand.g1_gripper_ik_solver import (
-        G1GripperInverseKinematicsSolver,
+    from gear_sonic.utils.teleop.solver.hand.g1_inspire_gripper_ik_solver import (
+        G1InspireGripperIKSolver,
     )
 except ImportError:
-    print("Warning: G1GripperInverseKinematicsSolver not available.")
-    G1GripperInverseKinematicsSolver = None
+    print("Warning: G1InspireGripperIKSolver not available.")
+    G1InspireGripperIKSolver = None
 
 try:
     from gear_sonic.utils.teleop.vis.vr3pt_pose_visualizer import VR3PtPoseVisualizer
@@ -596,13 +596,13 @@ def compute_from_body_poses(parent_indices: list, device, body_poses_np: np.ndar
 
 
 def init_hand_ik_solvers():
-    """Initialize hand IK solvers if available."""
-    if G1GripperInverseKinematicsSolver is not None:
-        left_solver = G1GripperInverseKinematicsSolver(side="left")
-        right_solver = G1GripperInverseKinematicsSolver(side="right")
-        print("Hand IK solvers initialized")
+    """Initialize Inspire hand IK solvers if available."""
+    if G1InspireGripperIKSolver is not None:
+        left_solver = G1InspireGripperIKSolver(side="left")
+        right_solver = G1InspireGripperIKSolver(side="right")
+        print("Inspire hand IK solvers initialized")
         return left_solver, right_solver
-    print("Warning: Hand IK solvers not available")
+    print("Warning: Inspire hand IK solvers not available")
     return None, None
 
 

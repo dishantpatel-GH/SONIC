@@ -31,7 +31,7 @@ def instantiate_g1_robot_model(
     robot_model_config = {
         "asset_path": os.path.join(project_root, "decoupled_wbc/control/robot_model/model_data/g1"),
         "urdf_path": os.path.join(
-            project_root, "decoupled_wbc/control/robot_model/model_data/g1/g1_29dof_with_hand.urdf"
+            project_root, "decoupled_wbc/control/robot_model/model_data/g1/g1_29dof_rev_1_0_with_inspire_hand_DFQ.urdf"
         ),
     }
     assert waist_location in [
