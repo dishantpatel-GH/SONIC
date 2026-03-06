@@ -15,8 +15,14 @@ from unitree_sdk2py.idl.default import (
     unitree_hg_msg_dds__HandCmd_ as HandCmd_default,
     unitree_hg_msg_dds__HandState_ as HandState_default,
 )
-from unitree_sdk2py.idl.unitree_go.msg.dds_ import WirelessController_
+from unitree_sdk2py.idl.unitree_go.msg.dds_ import WirelessController_, MotorCmds_
 from unitree_sdk2py.idl.unitree_hg.msg.dds_ import HandCmd_, HandState_, OdoState_
+
+INSPIRE_TOPIC_CMD = "rt/inspire/cmd"
+INSPIRE_NUM_MOTORS_PER_HAND = 6
+INSPIRE_TOTAL_MOTORS = 12
+INSPIRE_SIM_HAND_KP = 20.0
+INSPIRE_SIM_HAND_KD = 0.5
 
 
 class UnitreeSdk2Bridge:
@@ -97,12 +103,21 @@ class UnitreeSdk2Bridge:
         self.low_cmd_suber = ChannelSubscriber("rt/lowcmd", LowCmd_)
         self.low_cmd_suber.Init(self.LowCmdHandler, 1)
 
+        self.use_inspire_hands = self.num_hand_motor == INSPIRE_NUM_MOTORS_PER_HAND
         self.left_hand_cmd = HandCmd_default()
-        self.left_hand_cmd_suber = ChannelSubscriber("rt/dex3/left/cmd", HandCmd_)
-        self.left_hand_cmd_suber.Init(self.LeftHandCmdHandler, 1)
         self.right_hand_cmd = HandCmd_default()
-        self.right_hand_cmd_suber = ChannelSubscriber("rt/dex3/right/cmd", HandCmd_)
-        self.right_hand_cmd_suber.Init(self.RightHandCmdHandler, 1)
+        if self.use_inspire_hands:
+            self.inspire_cmd = None
+            self.inspire_cmd_lock = threading.Lock()
+            self.inspire_cmd_received = False
+            self.new_inspire_cmd = False
+            self.inspire_cmd_suber = ChannelSubscriber(INSPIRE_TOPIC_CMD, MotorCmds_)
+            self.inspire_cmd_suber.Init(self.InspireHandCmdHandler, 1)
+        else:
+            self.left_hand_cmd_suber = ChannelSubscriber("rt/dex3/left/cmd", HandCmd_)
+            self.left_hand_cmd_suber.Init(self.LeftHandCmdHandler, 1)
+            self.right_hand_cmd_suber = ChannelSubscriber("rt/dex3/right/cmd", HandCmd_)
+            self.right_hand_cmd_suber.Init(self.RightHandCmdHandler, 1)
 
         self.low_cmd_lock = threading.Lock()
         self.left_hand_cmd_lock = threading.Lock()
@@ -141,12 +156,17 @@ class UnitreeSdk2Bridge:
         with self.low_cmd_lock:
             self.low_cmd_received = False
             self.new_low_cmd = False
-        with self.left_hand_cmd_lock:
-            self.left_hand_cmd_received = False
-            self.new_left_hand_cmd = False
-        with self.right_hand_cmd_lock:
-            self.right_hand_cmd_received = False
-            self.new_right_hand_cmd = False
+        if self.use_inspire_hands:
+            with self.inspire_cmd_lock:
+                self.inspire_cmd_received = False
+                self.new_inspire_cmd = False
+        else:
+            with self.left_hand_cmd_lock:
+                self.left_hand_cmd_received = False
+                self.new_left_hand_cmd = False
+            with self.right_hand_cmd_lock:
+                self.right_hand_cmd_received = False
+                self.new_right_hand_cmd = False
 
     def LowCmdHandler(self, msg):
         with self.low_cmd_lock:
@@ -166,14 +186,46 @@ class UnitreeSdk2Bridge:
             self.right_hand_cmd_received = True
             self.new_right_hand_cmd = True
 
+    def InspireHandCmdHandler(self, msg):
+        with self.inspire_cmd_lock:
+            self.inspire_cmd = msg
+            self.inspire_cmd_received = True
+            self.new_inspire_cmd = True
+        if len(msg.cmds) >= INSPIRE_TOTAL_MOTORS:
+            kp = getattr(self, "_inspire_sim_kp", INSPIRE_SIM_HAND_KP)
+            kd = getattr(self, "_inspire_sim_kd", INSPIRE_SIM_HAND_KD)
+            with self.left_hand_cmd_lock:
+                for i in range(INSPIRE_NUM_MOTORS_PER_HAND):
+                    m = self.left_hand_cmd.motor_cmd[i]
+                    c = msg.cmds[INSPIRE_NUM_MOTORS_PER_HAND + i]
+                    m.q = c.q
+                    m.dq = c.dq
+                    m.kp = kp
+                    m.kd = kd
+                    m.tau = c.tau
+            with self.right_hand_cmd_lock:
+                for i in range(INSPIRE_NUM_MOTORS_PER_HAND):
+                    m = self.right_hand_cmd.motor_cmd[i]
+                    c = msg.cmds[i]
+                    m.q = c.q
+                    m.dq = c.dq
+                    m.kp = kp
+                    m.kd = kd
+                    m.tau = c.tau
+
     def cmd_received(self):
         with self.low_cmd_lock:
             low_cmd_received = self.low_cmd_received
-        with self.left_hand_cmd_lock:
-            left_hand_cmd_received = self.left_hand_cmd_received
-        with self.right_hand_cmd_lock:
-            right_hand_cmd_received = self.right_hand_cmd_received
-        return low_cmd_received or left_hand_cmd_received or right_hand_cmd_received
+        if self.use_inspire_hands:
+            with self.inspire_cmd_lock:
+                hand_cmd_received = self.inspire_cmd_received
+        else:
+            with self.left_hand_cmd_lock:
+                left_hand_cmd_received = self.left_hand_cmd_received
+            with self.right_hand_cmd_lock:
+                right_hand_cmd_received = self.right_hand_cmd_received
+            hand_cmd_received = left_hand_cmd_received or right_hand_cmd_received
+        return low_cmd_received or hand_cmd_received
 
     def PublishLowState(self, obs: Dict[str, any]):
         # publish body state
@@ -229,16 +281,33 @@ class UnitreeSdk2Bridge:
     def GetAction(self) -> Tuple[np.ndarray, bool, bool]:
         with self.low_cmd_lock:
             body_q = [self.low_cmd.motor_cmd[i].q for i in range(self.num_body_motor)]
-        with self.left_hand_cmd_lock:
-            left_hand_q = [self.left_hand_cmd.motor_cmd[i].q for i in range(self.num_hand_motor)]
-        with self.right_hand_cmd_lock:
-            right_hand_q = [self.right_hand_cmd.motor_cmd[i].q for i in range(self.num_hand_motor)]
-        with self.low_cmd_lock and self.left_hand_cmd_lock and self.right_hand_cmd_lock:
-            is_new_action = self.new_low_cmd and self.new_left_hand_cmd and self.new_right_hand_cmd
-            if is_new_action:
-                self.new_low_cmd = False
-                self.new_left_hand_cmd = False
-                self.new_right_hand_cmd = False
+        if self.use_inspire_hands:
+            with self.inspire_cmd_lock:
+                if self.inspire_cmd is not None and len(self.inspire_cmd.cmds) >= INSPIRE_TOTAL_MOTORS:
+                    right_hand_q = [self.inspire_cmd.cmds[i].q for i in range(INSPIRE_NUM_MOTORS_PER_HAND)]
+                    left_hand_q = [self.inspire_cmd.cmds[i].q for i in range(INSPIRE_NUM_MOTORS_PER_HAND, INSPIRE_TOTAL_MOTORS)]
+                else:
+                    left_hand_q = [0.0] * self.num_hand_motor
+                    right_hand_q = [0.0] * self.num_hand_motor
+            with self.low_cmd_lock:
+                with self.inspire_cmd_lock:
+                    is_new_action = self.new_low_cmd and self.new_inspire_cmd
+                    if is_new_action:
+                        self.new_low_cmd = False
+                        self.new_inspire_cmd = False
+        else:
+            with self.left_hand_cmd_lock:
+                left_hand_q = [self.left_hand_cmd.motor_cmd[i].q for i in range(self.num_hand_motor)]
+            with self.right_hand_cmd_lock:
+                right_hand_q = [self.right_hand_cmd.motor_cmd[i].q for i in range(self.num_hand_motor)]
+            with self.low_cmd_lock:
+                with self.left_hand_cmd_lock:
+                    with self.right_hand_cmd_lock:
+                        is_new_action = self.new_low_cmd and self.new_left_hand_cmd and self.new_right_hand_cmd
+                        if is_new_action:
+                            self.new_low_cmd = False
+                            self.new_left_hand_cmd = False
+                            self.new_right_hand_cmd = False
 
         return (
             np.concatenate([body_q[:-7], left_hand_q, body_q[-7:], right_hand_q]),

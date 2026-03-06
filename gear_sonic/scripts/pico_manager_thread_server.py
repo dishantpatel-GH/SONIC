@@ -492,6 +492,9 @@ def generate_finger_data(hand: str, trigger: float, grip: float) -> np.ndarray:
     """
     Generate finger position data from Pico controller button states.
 
+    Matches Dex hand mapping: trigger = index pinch, grip = ring, trigger+grip = middle.
+    Inspire IK solver maps these to index/ring/full close poses.
+
     Args:
         hand: "left" or "right"
         trigger: Trigger button value (0-1)
@@ -501,14 +504,18 @@ def generate_finger_data(hand: str, trigger: float, grip: float) -> np.ndarray:
         Array of shape [25, 4, 4] representing fingertip positions
     """
     fingertips = np.zeros([25, 4, 4])
-
     thumb = 0
+    index = 5
     middle = 10
-    # Control thumb based on shoulder button state (index 4 is thumb tip)
-    fingertips[4 + thumb, 0, 3] = 1.0  # open thumb
-    if trigger > 0.5:
-        fingertips[4 + middle, 0, 3] = 1.0  # close middle
-
+    ring = 15
+    # Thumb open (index 4 is thumb tip)
+    fingertips[4 + thumb, 0, 3] = 1.0
+    if trigger > 0.5 and grip <= 0.5:
+        fingertips[4 + index, 0, 3] = 1.0  # close index (trigger only)
+    elif trigger > 0.5 and grip > 0.5:
+        fingertips[4 + middle, 0, 3] = 1.0  # close middle (both)
+    elif trigger <= 0.5 and grip > 0.5:
+        fingertips[4 + ring, 0, 3] = 1.0   # close ring (grip only)
     return fingertips
 
 
