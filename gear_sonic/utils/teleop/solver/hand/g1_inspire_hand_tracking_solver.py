@@ -36,65 +36,119 @@ MIDDLE_MCP, MIDDLE_PROX, MIDDLE_INTER, MIDDLE_DIST, MIDDLE_TIP = 11, 12, 13, 14,
 RING_MCP, RING_PROX, RING_INTER, RING_DIST, RING_TIP = 16, 17, 18, 19, 20
 PINKY_MCP, PINKY_PROX, PINKY_INTER, PINKY_DIST, PINKY_TIP = 21, 22, 23, 24, 25
 
-# Angle (degrees) at which finger curl saturates at FINGER_MAX.
-# Typical fist curl produces ~100-140° between base and tip segment.
-FINGER_CURL_MAX_ANGLE = 120.0
-THUMB_CURL_MAX_ANGLE = 90.0
+# Finger curl uses normalized tip-to-base distance ratio.
+# OPEN_RATIO: ratio at/above which the finger is fully open (accounts for natural curvature).
+# CLOSED_RATIO: ratio at/below which the finger is fully closed.
+FINGER_OPEN_RATIO = 0.92
+FINGER_CLOSED_RATIO = 0.30
 
-# Thumb-to-index distance thresholds (meters) for thumb yaw mapping.
-# When thumb tip is far from index MCP → thumb is spread → yaw low.
-# When thumb tip is close to index MCP → thumb is adducted → yaw high.
-THUMB_YAW_DIST_FAR = 0.10   # thumb spread open
-THUMB_YAW_DIST_CLOSE = 0.02  # thumb adducted for pinch
+# Thumb curl (pitch) distance-ratio thresholds.
+# Pico data: open ≈ 0.99, curled ≈ 0.86. The usable range is narrow,
+# so we map aggressively: full pitch reached at moderate curl (0.91).
+THUMB_OPEN_RATIO = 0.97
+THUMB_CLOSED_RATIO = 0.91
 
+# Thumb yaw: driven by the max of two signals (palm proximity OR fingertip proximity).
+# Palm-based: thumb-tip-to-palm, normalized by hand span.
+# Pico data: spread ≈ 3.8-4.1, toward palm ≈ 2.3-2.6.
+THUMB_YAW_PALM_OPEN = 3.8
+THUMB_YAW_PALM_CLOSE = 2.3
 
-def _safe_normalize(v: np.ndarray, eps: float = 1e-8) -> np.ndarray:
-    n = np.linalg.norm(v)
-    if n < eps:
-        return np.zeros_like(v)
-    return v / n
-
-
-def _angle_between_deg(v1: np.ndarray, v2: np.ndarray) -> float:
-    """Angle in degrees between two direction vectors (0 = same dir, 180 = opposite)."""
-    u1 = _safe_normalize(v1)
-    u2 = _safe_normalize(v2)
-    dot = np.clip(np.dot(u1, u2), -1.0, 1.0)
-    return float(np.degrees(np.arccos(dot)))
+# Pinch-based: minimum thumb-tip-to-fingertip distance, normalized by hand span.
+# Spread ≈ 1.0-1.5, pinching ≈ 0.05-0.15.
+THUMB_YAW_PINCH_FAR = 1.0
+THUMB_YAW_PINCH_NEAR = 0.1
 
 
-def _finger_curl(pos: np.ndarray, mcp: int, prox: int, dist: int, tip: int) -> float:
+def _dist(a: np.ndarray, b: np.ndarray) -> float:
+    return float(np.linalg.norm(a - b))
+
+
+def _chain_length(pos: np.ndarray, *indices: int) -> float:
+    """Sum of segment lengths along a chain of joint indices."""
+    total = 0.0
+    for i in range(len(indices) - 1):
+        total += _dist(pos[indices[i]], pos[indices[i + 1]])
+    return total
+
+
+def _finger_curl(pos: np.ndarray, mcp: int, prox: int, inter: int, dist: int, tip: int) -> float:
     """
-    Compute finger curl amount from the joint chain.
+    Compute finger curl from the ratio of straight-line tip-to-MCP distance vs total chain length.
 
-    When finger is STRAIGHT: base segment (mcp→prox) and tip segment (dist→tip)
-    point the same direction → angle ≈ 0° → curl = 0.
-    When finger is CURLED: the segments diverge → angle grows → curl increases.
+    When finger is STRAIGHT: tip-to-MCP ≈ total chain length → ratio ≈ 1.0 → curl = 0.
+    When finger is CURLED into a fist: tip folds back → ratio drops → curl increases.
     """
-    seg_base = pos[prox] - pos[mcp]
-    seg_tip = pos[tip] - pos[dist]
-    angle = _angle_between_deg(seg_base, seg_tip)
-    t = np.clip(angle / FINGER_CURL_MAX_ANGLE, 0.0, 1.0)
-    return float(t * FINGER_MAX)
+    total_len = _chain_length(pos, mcp, prox, inter, dist, tip)
+    if total_len < 1e-6:
+        return 0.0
+    direct = _dist(pos[mcp], pos[tip])
+    ratio = direct / total_len
+
+    t = np.clip((FINGER_OPEN_RATIO - ratio) / (FINGER_OPEN_RATIO - FINGER_CLOSED_RATIO), 0.0, 1.0)
+    return float(FINGER_MIN + t * (FINGER_MAX - FINGER_MIN))
+
+
+def _pinch_t(pos: np.ndarray, hand_span: float) -> float:
+    """Normalized pinch signal: 0 = spread, 1 = thumb touching a fingertip."""
+    if hand_span < 1e-6:
+        return 0.0
+    min_finger_dist = min(
+        _dist(pos[THUMB_TIP], pos[INDEX_TIP]),
+        _dist(pos[THUMB_TIP], pos[MIDDLE_TIP]),
+        _dist(pos[THUMB_TIP], pos[RING_TIP]),
+        _dist(pos[THUMB_TIP], pos[PINKY_TIP]),
+    ) / hand_span
+    return float(np.clip(
+        (THUMB_YAW_PINCH_FAR - min_finger_dist) / (THUMB_YAW_PINCH_FAR - THUMB_YAW_PINCH_NEAR),
+        0.0, 1.0,
+    ))
 
 
 def _thumb_curl(pos: np.ndarray) -> float:
-    """Thumb pitch/curl from the thumb joint chain."""
-    seg_base = pos[THUMB_PROX] - pos[THUMB_MCP]
-    seg_tip = pos[THUMB_TIP] - pos[THUMB_DIST]
-    angle = _angle_between_deg(seg_base, seg_tip)
-    t = np.clip(angle / THUMB_CURL_MAX_ANGLE, 0.0, 1.0)
+    """
+    Thumb pitch/curl from the max of two signals:
+      1) Chain ratio: thumb joints physically curling
+      2) Pinch proximity: thumb tip near a fingertip (pinch doesn't curl the chain much)
+    """
+    total_len = _chain_length(pos, THUMB_MCP, THUMB_PROX, THUMB_DIST, THUMB_TIP)
+    if total_len < 1e-6:
+        return float(THUMB_PITCH_MIN)
+    direct = _dist(pos[THUMB_MCP], pos[THUMB_TIP])
+    ratio = direct / total_len
+
+    t_chain = np.clip((THUMB_OPEN_RATIO - ratio) / (THUMB_OPEN_RATIO - THUMB_CLOSED_RATIO), 0.0, 1.0)
+
+    hand_span = _dist(pos[WRIST], pos[MIDDLE_MCP])
+    t_pinch = _pinch_t(pos, hand_span)
+
+    t = max(float(t_chain), t_pinch)
     return float(THUMB_PITCH_MIN + t * (THUMB_PITCH_MAX - THUMB_PITCH_MIN))
 
 
 def _thumb_yaw(pos: np.ndarray) -> float:
     """
-    Thumb adduction via distance between thumb tip and index metacarpal.
-    Close distance = adducted (high yaw), far distance = abducted (low yaw).
+    Thumb opposition from the max of two signals:
+      1) Palm proximity: thumb tip near palm center → curling into palm
+      2) Pinch proximity: thumb tip near any fingertip → pinch gesture
+
+    Either gesture drives yaw up; whichever is stronger wins.
     """
-    dist = float(np.linalg.norm(pos[THUMB_TIP] - pos[INDEX_MCP]))
-    t = (THUMB_YAW_DIST_FAR - dist) / (THUMB_YAW_DIST_FAR - THUMB_YAW_DIST_CLOSE + 1e-8)
-    t = np.clip(t, 0.0, 1.0)
+    hand_span = _dist(pos[WRIST], pos[MIDDLE_MCP])
+    if hand_span < 1e-6:
+        return float(THUMB_YAW_MIN)
+
+    # Signal 1: palm proximity (curling toward palm)
+    tip_to_palm = _dist(pos[THUMB_TIP], pos[PALM]) / hand_span
+    t_palm = np.clip(
+        (THUMB_YAW_PALM_OPEN - tip_to_palm) / (THUMB_YAW_PALM_OPEN - THUMB_YAW_PALM_CLOSE),
+        0.0, 1.0,
+    )
+
+    # Signal 2: pinch proximity (thumb tip near closest fingertip)
+    t_pinch = _pinch_t(pos, hand_span)
+
+    t = max(t_palm, t_pinch)
     return float(THUMB_YAW_MIN + t * (THUMB_YAW_MAX - THUMB_YAW_MIN))
 
 
@@ -129,21 +183,33 @@ class G1InspireHandTrackingSolver(Solver):
 
         pos = hand_tracking_state[:, :3]
 
-        if self._call_count == 0:
-            np.set_printoptions(precision=4, suppress=True)
-            print(f"[HandTrackSolver-{self.side}] first call — wrist={pos[WRIST]}, "
-                  f"index_tip={pos[INDEX_TIP]}, thumb_tip={pos[THUMB_TIP]}")
-
         try:
             q[0] = _thumb_yaw(pos)
             q[1] = _thumb_curl(pos)
-            q[2] = _finger_curl(pos, INDEX_MCP, INDEX_PROX, INDEX_DIST, INDEX_TIP)
-            q[3] = _finger_curl(pos, MIDDLE_MCP, MIDDLE_PROX, MIDDLE_DIST, MIDDLE_TIP)
-            q[4] = _finger_curl(pos, RING_MCP, RING_PROX, RING_DIST, RING_TIP)
-            q[5] = _finger_curl(pos, PINKY_MCP, PINKY_PROX, PINKY_DIST, PINKY_TIP)
+            q[2] = _finger_curl(pos, INDEX_MCP, INDEX_PROX, INDEX_INTER, INDEX_DIST, INDEX_TIP)
+            q[3] = _finger_curl(pos, MIDDLE_MCP, MIDDLE_PROX, MIDDLE_INTER, MIDDLE_DIST, MIDDLE_TIP)
+            q[4] = _finger_curl(pos, RING_MCP, RING_PROX, RING_INTER, RING_DIST, RING_TIP)
+            q[5] = _finger_curl(pos, PINKY_MCP, PINKY_PROX, PINKY_INTER, PINKY_DIST, PINKY_TIP)
         except Exception as e:
             if self._call_count % 200 == 0:
                 print(f"[HandTrackSolver-{self.side}] error: {e}")
+
+        if self._call_count % 100 == 0:
+            hand_span = _dist(pos[WRIST], pos[MIDDLE_MCP])
+            hs = max(hand_span, 1e-6)
+            thumb_chain = _chain_length(pos, THUMB_MCP, THUMB_PROX, THUMB_DIST, THUMB_TIP)
+            thumb_ratio = _dist(pos[THUMB_MCP], pos[THUMB_TIP]) / max(thumb_chain, 1e-6)
+            tip_palm_n = _dist(pos[THUMB_TIP], pos[PALM]) / hs
+            pinch_n = min(
+                _dist(pos[THUMB_TIP], pos[INDEX_TIP]),
+                _dist(pos[THUMB_TIP], pos[MIDDLE_TIP]),
+                _dist(pos[THUMB_TIP], pos[RING_TIP]),
+                _dist(pos[THUMB_TIP], pos[PINKY_TIP]),
+            ) / hs
+            print(
+                f"[HT-{self.side}] q={np.array2string(q, precision=3, suppress_small=True)} | "
+                f"t_ratio={thumb_ratio:.3f} palm={tip_palm_n:.2f} pinch={pinch_n:.2f}"
+            )
 
         self._call_count += 1
         return q
