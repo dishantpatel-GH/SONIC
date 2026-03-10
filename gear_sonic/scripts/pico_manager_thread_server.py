@@ -85,6 +85,14 @@ except ImportError:
     G1InspireGripperIKSolver = None
 
 try:
+    from gear_sonic.utils.teleop.solver.hand.g1_inspire_hand_tracking_solver import (
+        G1InspireHandTrackingSolver,
+    )
+except ImportError:
+    print("Warning: G1InspireHandTrackingSolver not available.")
+    G1InspireHandTrackingSolver = None
+
+try:
     from gear_sonic.utils.teleop.vis.vr3pt_pose_visualizer import VR3PtPoseVisualizer
 except ImportError:
     print("Warning: VR3PtPoseVisualizer not available (pyvista may not be installed).")
@@ -314,6 +322,90 @@ def _process_3pt_pose(smpl_pose_np):
     # kp_poses[1:] = indices 1, 2, 3 = L-Wrist, R-Wrist, Neck
     # Each row: [x, y, z, qw, qx, qy, qz] relative to root, scalar-first quaternion
     return kp_poses[1:]
+
+
+# Rotation offsets for hand-tracking wrists and head (same convention as OFFSETS[1], [2], [3])
+HT_OFFSETS = [
+    sRot.from_euler("xyz", [90, 0, 0], degrees=True),   # L-Wrist
+    sRot.from_euler("xyz", [-90, 0, 180], degrees=True),  # R-Wrist
+    sRot.from_euler("xyz", [0, 0, -90], degrees=True),   # Neck/Head
+]
+
+
+def _process_hand_tracking_3pt_pose(
+    body_poses_np: np.ndarray,
+    left_hand_tracking_state: np.ndarray,
+    right_hand_tracking_state: np.ndarray,
+    headset_pose: np.ndarray,
+) -> np.ndarray:
+    """
+    Compute VR 3-point pose (L-Wrist, R-Wrist, Neck) from hand tracking wrists
+    and headset, using SMPL root as reference so calibration remains valid.
+
+    Args:
+        body_poses_np: (24, 7) SMPL joints [x, y, z, qx, qy, qz, qw] Unity frame.
+        left_hand_tracking_state: (26, 7) left hand joints, row 1 = wrist.
+        right_hand_tracking_state: (26, 7) right hand joints, row 1 = wrist.
+        headset_pose: (7,) [x, y, z, qx, qy, qz, qw] Unity frame.
+
+    Returns:
+        vr_3pt_pose: (3, 7) [L-Wrist, R-Wrist, Neck], each row [x, y, z, qw, qx, qy, qz]
+                     relative to SMPL root, scalar-first quaternion (same format as
+                     _process_3pt_pose for ThreePointPose._apply_calibration).
+    """
+    body_poses_np = body_poses_np.copy()
+    root_pose = body_poses_np[0].copy()
+    root_pos, root_quat = _compute_rel_transform(
+        root_pose, [0, 0, 0, 0, 0, 0, 1], scalar_first=False
+    )
+    root_quat_scipy = root_quat  # [qw, qx, qy, qz]
+    root_rot = sRot.from_quat(root_quat_scipy, scalar_first=True)
+
+    # Left wrist from hand tracking (joint 1)
+    lw_pose = np.zeros(7, dtype=np.float64)
+    lw_pose[:3] = left_hand_tracking_state[1, :3].copy()
+    lw_pose[3:] = left_hand_tracking_state[1, 3:].copy()  # qx,qy,qz,qw
+    lw_pos, lw_orn = _compute_rel_transform(
+        lw_pose, [0, 0, 0, 0, 0, 0, 1], scalar_first=False
+    )
+    lw_rot = sRot.from_quat(lw_orn, scalar_first=True) * HT_OFFSETS[0]
+    lw_quat = lw_rot.as_quat(scalar_first=True)
+
+    # Right wrist from hand tracking (joint 1)
+    rw_pose = np.zeros(7, dtype=np.float64)
+    rw_pose[:3] = right_hand_tracking_state[1, :3].copy()
+    rw_pose[3:] = right_hand_tracking_state[1, 3:].copy()
+    rw_pos, rw_orn = _compute_rel_transform(
+        rw_pose, [0, 0, 0, 0, 0, 0, 1], scalar_first=False
+    )
+    rw_rot = sRot.from_quat(rw_orn, scalar_first=True) * HT_OFFSETS[1]
+    rw_quat = rw_rot.as_quat(scalar_first=True)
+
+    # Neck/head from headset
+    head_pose = headset_pose.copy()
+    head_pos, head_orn = _compute_rel_transform(
+        head_pose, [0, 0, 0, 0, 0, 0, 1], scalar_first=False
+    )
+    head_rot = sRot.from_quat(head_orn, scalar_first=True) * HT_OFFSETS[2]
+    head_quat = head_rot.as_quat(scalar_first=True)
+
+    # Make positions and orientations relative to root
+    root_rot_inv = root_rot.inv()
+    lw_pos_rel = root_rot_inv.apply(lw_pos - root_pos)
+    rw_pos_rel = root_rot_inv.apply(rw_pos - root_pos)
+    head_pos_rel = root_rot_inv.apply(head_pos - root_pos)
+    lw_quat_rel = (root_rot_inv * lw_rot).as_quat(scalar_first=True)
+    rw_quat_rel = (root_rot_inv * rw_rot).as_quat(scalar_first=True)
+    head_quat_rel = (root_rot_inv * head_rot).as_quat(scalar_first=True)
+
+    vr_3pt_pose = np.zeros((3, 7), dtype=np.float32)
+    vr_3pt_pose[0, :3] = lw_pos_rel
+    vr_3pt_pose[0, 3:] = lw_quat_rel
+    vr_3pt_pose[1, :3] = rw_pos_rel
+    vr_3pt_pose[1, 3:] = rw_quat_rel
+    vr_3pt_pose[2, :3] = head_pos_rel
+    vr_3pt_pose[2, 3:] = head_quat_rel
+    return vr_3pt_pose
 
 
 # =============================================================================
@@ -613,6 +705,17 @@ def init_hand_ik_solvers():
     return None, None
 
 
+def init_hand_tracking_solvers():
+    """Initialize Inspire hand tracking solvers if available."""
+    if G1InspireHandTrackingSolver is not None:
+        left_solver = G1InspireHandTrackingSolver(side="left")
+        right_solver = G1InspireHandTrackingSolver(side="right")
+        print("Inspire hand tracking solvers initialized")
+        return left_solver, right_solver
+    print("Warning: Inspire hand tracking solvers not available")
+    return None, None
+
+
 def get_controller_inputs():
     """Fetch controller button/trigger states from XRoboToolkit."""
     left_trigger = xrt.get_left_trigger()
@@ -793,6 +896,26 @@ class PicoReader:
             try:
                 body_poses = xrt.get_body_joints_pose()
 
+                left_hand_active_flag = int(xrt.get_left_hand_is_active())
+                right_hand_active_flag = int(xrt.get_right_hand_is_active())
+
+                # Always read hand tracking data — isActive is a quality hint,
+                # not an availability gate. The array exists even at low quality.
+                raw_left = np.array(
+                    xrt.get_left_hand_tracking_state(), dtype=np.float32
+                )
+                raw_right = np.array(
+                    xrt.get_right_hand_tracking_state(), dtype=np.float32
+                )
+
+                # Consider tracking valid when at least the wrist position is non-zero
+                left_hand_valid = bool(np.any(raw_left[1, :3] != 0))
+                right_hand_valid = bool(np.any(raw_right[1, :3] != 0))
+                left_hand_tracking_state = raw_left if left_hand_valid else None
+                right_hand_tracking_state = raw_right if right_hand_valid else None
+
+                headset_pose = np.array(xrt.get_headset_pose(), dtype=np.float32)
+
                 sample = {
                     "body_poses_np": np.array(body_poses),
                     "timestamp_realtime": t_realtime,
@@ -800,13 +923,27 @@ class PicoReader:
                     "timestamp_ns": stamp_ns,
                     "dt": device_dt,
                     "fps": self._fps_ema,
+                    "left_hand_active": left_hand_active_flag,
+                    "right_hand_active": right_hand_active_flag,
+                    "left_hand_valid": left_hand_valid,
+                    "right_hand_valid": right_hand_valid,
+                    "left_hand_tracking_state": left_hand_tracking_state,
+                    "right_hand_tracking_state": right_hand_tracking_state,
+                    "headset_pose": headset_pose,
                 }
                 with self._lock:
                     self._latest = sample
                 now = time.time()
                 if now - last_report >= 5.0:
+                    ht_status = (
+                        f"L:{'VALID' if left_hand_valid else 'none'}"
+                        f"(q={left_hand_active_flag}) "
+                        f"R:{'VALID' if right_hand_valid else 'none'}"
+                        f"(q={right_hand_active_flag})"
+                    )
                     print(
-                        f"[PicoReader] dt_ts: {device_dt*1000.0:.2f} ms, fps: {self._fps_ema:.2f}"
+                        f"[PicoReader] dt_ts: {device_dt*1000.0:.2f} ms, "
+                        f"fps: {self._fps_ema:.2f}, hands: {ht_status}"
                     )
                     last_report = now
             except Exception as e:
@@ -1098,8 +1235,17 @@ class ThreePointPose:
             f"{self._calibration_rwrist_offset[1]:.4f}, {self._calibration_rwrist_offset[2]:.4f}]"
         )
 
-    def _apply_calibration(self, vr_3pt_pose: np.ndarray) -> np.ndarray:
-        """Apply stored calibration offsets to raw VR 3-point pose."""
+    def _apply_calibration(
+        self, vr_3pt_pose: np.ndarray, skip_wrist_pos_offsets: bool = False
+    ) -> np.ndarray:
+        """Apply stored calibration offsets to raw VR 3-point pose.
+
+        Args:
+            vr_3pt_pose: (3, 7) raw VR 3-point pose.
+            skip_wrist_pos_offsets: If True, skip wrist position offset subtraction.
+                Use this for hand-tracking data where wrist positions are physically
+                accurate and shouldn't have SMPL-derived offsets applied.
+        """
         if self._calibration_neck_quat_inv is None:
             return vr_3pt_pose
 
@@ -1110,15 +1256,19 @@ class ThreePointPose:
         neck_rot = sRot.from_quat(vr_3pt_pose[2, 3:], scalar_first=True)
         calibrated[2, 3:] = (calib_inv_rot * neck_rot).as_quat(scalar_first=True)
 
-        # Wrist positions: rotate by neck inverse, then subtract offset
-        if self._calibration_lwrist_offset is not None:
+        # Wrist positions: rotate by neck inverse, then subtract offset (unless skipped)
+        if not skip_wrist_pos_offsets and self._calibration_lwrist_offset is not None:
             calibrated[0, :3] = (
                 calib_inv_rot.apply(vr_3pt_pose[0, :3]) - self._calibration_lwrist_offset
             )
-        if self._calibration_rwrist_offset is not None:
+        elif skip_wrist_pos_offsets:
+            calibrated[0, :3] = calib_inv_rot.apply(vr_3pt_pose[0, :3])
+        if not skip_wrist_pos_offsets and self._calibration_rwrist_offset is not None:
             calibrated[1, :3] = (
                 calib_inv_rot.apply(vr_3pt_pose[1, :3]) - self._calibration_rwrist_offset
             )
+        elif skip_wrist_pos_offsets:
+            calibrated[1, :3] = calib_inv_rot.apply(vr_3pt_pose[1, :3])
 
         # Wrist orientations: rot_offset * (neck_inv * current)
         if self._calibration_lwrist_rot_offset is not None:
@@ -1204,6 +1354,9 @@ class PoseStreamer:
         self.record_idx = 0
 
         self.left_hand_ik_solver, self.right_hand_ik_solver = init_hand_ik_solvers()
+        self.left_hand_tracking_solver, self.right_hand_tracking_solver = (
+            init_hand_tracking_solvers()
+        )
         self.parent_indices = [
             -1,
             0,
@@ -1300,14 +1453,26 @@ class PoseStreamer:
         self.toggle_data_collection_last = toggle_data_collection_tmp
         self.toggle_data_abort_last = toggle_data_abort_tmp
 
-        left_hand_joints, right_hand_joints = compute_hand_joints_from_inputs(
-            self.left_hand_ik_solver,
-            self.right_hand_ik_solver,
-            left_trigger,
-            left_grip,
-            right_trigger,
-            right_grip,
-        )
+        # Use hand tracking for fingers when available, fall back to controllers
+        lht = sample.get("left_hand_tracking_state")
+        rht = sample.get("right_hand_tracking_state")
+        if (
+            lht is not None
+            and rht is not None
+            and self.left_hand_tracking_solver is not None
+            and self.right_hand_tracking_solver is not None
+        ):
+            left_hand_joints = self.left_hand_tracking_solver(lht)
+            right_hand_joints = self.right_hand_tracking_solver(rht)
+        else:
+            left_hand_joints, right_hand_joints = compute_hand_joints_from_inputs(
+                self.left_hand_ik_solver,
+                self.right_hand_ik_solver,
+                left_trigger,
+                left_grip,
+                right_trigger,
+                right_grip,
+            )
         smpl_pose_np = (
             latest_data["smpl_pose"].detach().cpu().numpy()[:, :63].reshape(-1, 21, 3)[0]
         ).astype(np.float32)
@@ -1652,6 +1817,12 @@ class PlannerStreamer:
 
         # Hand IK solvers for trigger-controlled hand open/close in VR 3PT mode
         self.left_hand_ik_solver, self.right_hand_ik_solver = init_hand_ik_solvers()
+        # Hand tracking solvers for bare-hand control in VR 3PT mode (auto-detect)
+        self.left_hand_tracking_solver, self.right_hand_tracking_solver = (
+            init_hand_tracking_solvers()
+        )
+        self._last_hand_tracking_active = False
+        self._ht_debug_counter = 0
 
     def reset_yaw(self):
         """Called when entering planner mode. Resets state for fresh start."""
@@ -1753,30 +1924,72 @@ class PlannerStreamer:
             if stream_mode == StreamMode.PLANNER_VR_3PT:
                 sample = self.reader.get_latest()
                 if sample is not None:
-                    print("[PlannerLoop] Sending VR 3-point pose as target")
-                    vr_3pt_pose = self.three_point.process_smpl_pose(sample["body_poses_np"])
-                    vr_3pt_position = (vr_3pt_pose[:, :3].flatten()).tolist()
-                    vr_3pt_orientation = vr_3pt_pose[:, 3:].flatten().tolist()
+                    use_hand_tracking = (
+                        sample.get("left_hand_valid", False)
+                        and sample.get("right_hand_valid", False)
+                        and self.left_hand_tracking_solver is not None
+                        and self.right_hand_tracking_solver is not None
+                        and sample.get("left_hand_tracking_state") is not None
+                        and sample.get("right_hand_tracking_state") is not None
+                    )
 
-                # Compute hand joints from trigger/grip inputs so operator can
-                # control hand open/close while in VR 3PT mode
-                (
-                    left_menu_button,
-                    left_trigger,
-                    right_trigger,
-                    left_grip,
-                    right_grip,
-                ) = get_controller_inputs()
-                lh_joints, rh_joints = compute_hand_joints_from_inputs(
-                    self.left_hand_ik_solver,
-                    self.right_hand_ik_solver,
-                    left_trigger,
-                    left_grip,
-                    right_trigger,
-                    right_grip,
-                )
-                left_hand_position = lh_joints.reshape(-1).astype(np.float32).tolist()
-                right_hand_position = rh_joints.reshape(-1).astype(np.float32).tolist()
+                    if use_hand_tracking:
+                        if not self._last_hand_tracking_active:
+                            print("[PlannerLoop] Hand tracking active: using wrist + finger tracking")
+                        self._last_hand_tracking_active = True
+                        vr_3pt_pose_raw = _process_hand_tracking_3pt_pose(
+                            sample["body_poses_np"],
+                            sample["left_hand_tracking_state"],
+                            sample["right_hand_tracking_state"],
+                            sample["headset_pose"],
+                        )
+                        vr_3pt_pose = self.three_point._apply_calibration(
+                            vr_3pt_pose_raw, skip_wrist_pos_offsets=True
+                        )
+                        vr_3pt_position = (vr_3pt_pose[:, :3].flatten()).tolist()
+                        vr_3pt_orientation = vr_3pt_pose[:, 3:].flatten().tolist()
+                        lh_joints = self.left_hand_tracking_solver(
+                            sample["left_hand_tracking_state"]
+                        )
+                        rh_joints = self.right_hand_tracking_solver(
+                            sample["right_hand_tracking_state"]
+                        )
+                        left_hand_position = lh_joints.reshape(-1).astype(np.float32).tolist()
+                        right_hand_position = rh_joints.reshape(-1).astype(np.float32).tolist()
+
+                        self._ht_debug_counter += 1
+                        if self._ht_debug_counter % 100 == 1:
+                            np.set_printoptions(precision=3, suppress=True)
+                            print(
+                                f"[HT-DBG] L_hand={lh_joints}  R_hand={rh_joints}\n"
+                                f"         L_wrist_pos={sample['left_hand_tracking_state'][1,:3]}"
+                            )
+                    else:
+                        if self._last_hand_tracking_active:
+                            print("[PlannerLoop] Hand tracking inactive: using body tracking + controllers")
+                        self._last_hand_tracking_active = False
+                        vr_3pt_pose = self.three_point.process_smpl_pose(
+                            sample["body_poses_np"]
+                        )
+                        vr_3pt_position = (vr_3pt_pose[:, :3].flatten()).tolist()
+                        vr_3pt_orientation = vr_3pt_pose[:, 3:].flatten().tolist()
+                        (
+                            _left_menu_button,
+                            left_trigger,
+                            right_trigger,
+                            left_grip,
+                            right_grip,
+                        ) = get_controller_inputs()
+                        lh_joints, rh_joints = compute_hand_joints_from_inputs(
+                            self.left_hand_ik_solver,
+                            self.right_hand_ik_solver,
+                            left_trigger,
+                            left_grip,
+                            right_trigger,
+                            right_grip,
+                        )
+                        left_hand_position = lh_joints.reshape(-1).astype(np.float32).tolist()
+                        right_hand_position = rh_joints.reshape(-1).astype(np.float32).tolist()
 
             msg = build_planner_message(
                 mode_to_send.value,
