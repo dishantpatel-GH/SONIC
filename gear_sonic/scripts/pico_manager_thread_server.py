@@ -25,7 +25,9 @@
 from collections import defaultdict, deque
 from enum import Enum, IntEnum
 import os
+import select
 import subprocess
+import sys
 import threading
 import time
 
@@ -137,6 +139,54 @@ class StreamMode(Enum):
     PLANNER_FROZEN_UPPER_BODY = 3
     POSE_PAUSE = 4
     PLANNER_VR_3PT = 5
+
+
+class KeyboardListener:
+    """Non-blocking keyboard listener for terminal-based mode switching.
+
+    Runs a daemon thread that reads single keypresses (no Enter required)
+    and exposes them via pop_key() for the main loop to consume.
+
+    Keys:
+        p  — toggle POSE mode   (replaces A+X on controller)
+        s  — start/stop policy  (replaces A+B+X+Y on controller)
+        q  — quit / emergency stop
+    """
+
+    def __init__(self):
+        self._queue: deque[str] = deque(maxlen=8)
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._old_settings = None
+
+    def start(self):
+        import termios
+        import tty
+
+        self._old_settings = termios.tcgetattr(sys.stdin)
+        tty.setcbreak(sys.stdin.fileno())
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._old_settings is not None:
+            import termios
+
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self._old_settings)
+
+    def pop_key(self) -> str | None:
+        """Return the oldest unprocessed key, or None."""
+        try:
+            return self._queue.popleft()
+        except IndexError:
+            return None
+
+    def _run(self):
+        while not self._stop.is_set():
+            if select.select([sys.stdin], [], [], 0.05)[0]:
+                ch = sys.stdin.read(1)
+                if ch:
+                    self._queue.append(ch.lower())
 
 
 ### Parse 3 point pose from SMPL
@@ -2113,7 +2163,12 @@ def run_pico_manager(
     #   Emergency stop from any mode: A+B+X+Y (start_combo) --> OFF
     #   POSE_PAUSE: left_menu_button held --> POSE_PAUSE, released --> POSE
     #
-    print("Manager controls: A+X=toggle mode, A+B+X+Y=start/stop policy")
+    # Keyboard listener for terminal-based mode switching
+    kbd = KeyboardListener()
+    kbd.start()
+    print("Manager controls:")
+    print("  Controller: A+X=toggle mode, A+B+X+Y=start/stop policy")
+    print("  Keyboard:   p=toggle POSE mode, s=start/stop policy, q=quit")
     current_mode = StreamMode.OFF
     # Track which mode VR_3PT was entered from, so left_axis_click returns to it.
     # Will be either PLANNER or PLANNER_FROZEN_UPPER_BODY.
@@ -2139,6 +2194,21 @@ def run_pico_manager(
 
             # Rising edge: A+B+X+Y pressed together -> toggle policy start/stop (planner=True)
             start_combo = (a_pressed) and (b_pressed) and (x_pressed) and (y_pressed)
+
+            # --- Keyboard overrides (single-press, no rising-edge needed) ---
+            key = kbd.pop_key()
+            if key == "p":
+                # Simulate A+X rising edge: toggle POSE <-> PLANNER
+                ax_pressed = True
+                prev_ax_pressed = False
+            elif key == "s":
+                # Simulate A+B+X+Y rising edge: start/stop policy
+                start_combo = True
+                prev_start_combo = False
+            elif key == "q":
+                print("[Manager] Keyboard quit requested")
+                start_combo = True
+                prev_start_combo = False
 
             new_mode = current_mode
             if current_mode == StreamMode.OFF:
@@ -2265,6 +2335,7 @@ def run_pico_manager(
         print("\nStopping manager...")
     finally:
         # Cleanup resources
+        kbd.stop()
         reader.stop()
         three_point.close()
         socket.close()
