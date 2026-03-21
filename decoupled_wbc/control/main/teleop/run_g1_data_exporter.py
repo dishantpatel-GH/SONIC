@@ -13,7 +13,7 @@ from decoupled_wbc.control.robot_model.instantiation import g1
 from decoupled_wbc.control.sensor.composed_camera import ComposedCameraClientSensor
 from decoupled_wbc.control.utils.episode_state import EpisodeState
 from decoupled_wbc.control.utils.keyboard_dispatcher import KeyboardListenerSubscriber
-from decoupled_wbc.control.utils.ros_utils import ROSMsgSubscriber, ROSServiceClient
+from decoupled_wbc.control.utils.ros_utils import ROSMsgSubscriber
 from decoupled_wbc.control.utils.telemetry import Telemetry
 from decoupled_wbc.control.utils.text_to_speech import TextToSpeech
 from decoupled_wbc.data.constants import BUCKET_BASE_PATH
@@ -154,6 +154,8 @@ class Gr00tDataCollector:
 
         if self._episode_state.get_state() == self._episode_state.RECORDING:
 
+            # observation.state and action include full robot joints (arms, hands, etc.).
+            # When hand_type is "inspire", Inspire hand joint positions/commands are included.
             # Calculate max time delta between images and proprio
             max_time_delta = 0
             for _, image_time in self.latest_image_msg["timestamps"].items():
@@ -304,8 +306,10 @@ def main(config: DataExporterConfig):
         # This will be ignored if the dataset already exists
         data_collection_info = DataCollectionInfo()
 
-    robot_config_client = ROSServiceClient(ROBOT_CONFIG_TOPIC)
-    robot_config = robot_config_client.get_config()
+    # The C++ deploy publishes robot_config as a topic, not a service.
+    # Skip the service call and use an empty config dict for metadata.
+    robot_config = {}
+    print("[INFO] Skipping robot_config service (deploy publishes as topic). Using empty config.")
 
     data_exporter = Gr00tDataExporter.create(
         save_root=f"{config.root_output_dir}/{config.dataset_name}",

@@ -1,440 +1,549 @@
-from collections import deque
-from dataclasses import dataclass
-import queue
-import threading
+import cv2
+import zmq
 import time
-from typing import Any, Dict, Optional
+import struct
+import pickle
+from collections import deque
+import numpy as np
+import pyrealsense2 as rs
+import logging
 
-# we need to import these first in this order to avoid TSL segmentation fault
-# caused by zed and oak libraries
 try:
-    import cv2  # noqa
-    import depthai as dai  # noqa
-    import pyzed.sl as sl  # noqa
+    import logging_mp
+    logger_mp = logging_mp.getLogger(__name__)
+except (ImportError, AttributeError):
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+    logger_mp = logging.getLogger(__name__)
+
+try:
+    from teleop.image_server.depth_visualization_3ddp import depth_to_visualization
 except ImportError:
-    print(
+    try:
+        from decoupled_wbc.control.sensor.depth_visualization_3ddp import depth_to_visualization
+    except ImportError:
+        from depth_visualization_3ddp import depth_to_visualization
+
+
+def _depth_to_display(depth: np.ndarray, near_mm: int, far_mm: int, style: str = "3ddp") -> np.ndarray:
+    """Use 3D-Diffusion-Policy style (3ddp) or fallback heatmap."""
+    return depth_to_visualization(depth, style=style, near_mm=near_mm, far_mm=far_mm)
+
+
+class RealSenseCamera(object):
+    def __init__(self, img_shape, fps, serial_number=None, enable_depth=False) -> None:
         """
-    Some of the camera specific dependencies are not installed. If you are
-    not running this on the robot, having these libraries is optional.
-    """
-    )
+        img_shape: [height, width]
+        serial_number: serial number
+        """
+        self.img_shape = img_shape
+        self.fps = fps
+        self.serial_number = serial_number
+        self.enable_depth = enable_depth
 
-import numpy as np  # noqa
+        align_to = rs.stream.color
+        self.align = rs.align(align_to)
+        self.init_realsense()
 
-from decoupled_wbc.control.base.sensor import Sensor
-from decoupled_wbc.control.sensor.sensor_server import (
-    ImageMessageSchema,
-    SensorClient,
-    SensorServer,
-    CameraMountPosition,
-)
+    def init_realsense(self):
 
+        self.pipeline = rs.pipeline()
+        config = rs.config()
+        if self.serial_number is not None:
+            config.enable_device(self.serial_number)
 
-def read_qr_code(data):
-    current_time = time.monotonic()
-    detector = cv2.QRCodeDetector()
-    for key, img in data["images"].items():
-        decoded_time, bbox, _ = detector.detectAndDecode(img)
-        if bbox is not None and decoded_time:
-            print(f"{key} latency: {(current_time - float(decoded_time)) * 1e3:.1f} ms")
-        else:
-            print(f"{key} QR code not detected.")
-
-
-@dataclass
-class ComposedCameraConfig:
-    """Camera configuration for composed camera"""
-
-    ego_view_camera: Optional[str] = "oak"
-    """Camera type for ego view: oak, realsense, zed, or None"""
-
-    ego_view_device_id: Optional[str] = None
-    """Device ID for ego view camera (optional, used for OAK cameras)"""
-
-    head_camera: Optional[str] = None
-    """Camera type for head view: oak, oak_mono, realsense, zed or None"""
-
-    head_device_id: Optional[str] = None
-    """Device ID for head camera (optional, used for OAK cameras)"""
-
-    left_wrist_camera: Optional[str] = None
-    """Camera type for left wrist view: oak, realsense, zed or None"""
-
-    left_wrist_device_id: Optional[str] = None
-    """Device ID for left wrist camera (optional, used for OAK cameras)"""
-
-    right_wrist_camera: Optional[str] = None
-    """Camera type for right wrist view: oak, realsense, zed or None"""
-
-    right_wrist_device_id: Optional[str] = None
-    """Device ID for right wrist camera (optional, used for OAK cameras)"""
-
-    fps: int = 30
-    """Rate at which the composed camera will publish the images. Since composed camera
-    can read from multiple cameras, it will publish all the images.
-    Note that OAK can only run at 30 FPS. 20 FPS will cause large latency.
-    """
-
-    # Server configuration
-    run_as_server: bool = True
-    """Whether to run as server or client"""
-
-    server: bool = True
-    """Whether to run the camera as a server"""
-
-    port: int = 5555
-    """Port number for server/client communication"""
-
-    test_latency: bool = False
-    """Whether to test latency"""
-
-    # Queue configuration
-    queue_size: int = 3
-    """Size of each camera's image queue"""
-
-    def __post_init__(self):
-        # runyu: Note that this is a hack to make the config work with G1 camera server in orin
-        # we should not use this hack in the future
-        self.run_as_server: bool = self.server
-
-
-class ComposedCameraSensor(Sensor, SensorServer):
-
-    def __init__(self, config: ComposedCameraConfig):
-        self.config = config
-        self.camera_queues: Dict[str, queue.Queue] = {}
-        self.camera_threads: Dict[str, threading.Thread] = {}
-        self.shutdown_events: Dict[str, threading.Event] = {}
-        self.error_events: Dict[str, threading.Event] = {}
-        self.error_messages: Dict[str, str] = {}
-        self._observation_spaces: Dict[str, Any] = {}
-
-        camera_configs = self._get_camera_configs()
-
-        # Then create worker threads
-        for mount_position, camera_config in camera_configs.items():
-            # Create queue and shutdown event for this camera
-            camera_queue = queue.Queue(maxsize=config.queue_size)
-            shutdown_event = threading.Event()
-            error_event = threading.Event()
-
-            self.camera_queues[mount_position] = camera_queue
-            self.shutdown_events[mount_position] = shutdown_event
-            self.error_events[mount_position] = error_event
-
-            # Start camera thread
-            thread = threading.Thread(
-                target=self._camera_worker_wrapper,
-                args=(
-                    mount_position,
-                    camera_config["camera_type"],
-                    camera_config["device_id"],
-                    camera_queue,
-                    shutdown_event,
-                    error_event,
-                ),
-            )
-            thread.start()
-            self.camera_threads[mount_position] = thread
-
-        if config.run_as_server:
-            self.start_server(config.port)
-
-    def _get_camera_configs(self) -> Dict[str, str]:
-        """Get camera configurations as mount_position -> camera_type mapping"""
-        camera_configs = {}
-
-        if self.config.ego_view_camera is not None:
-            camera_configs[CameraMountPosition.EGO_VIEW.value] = {
-                "camera_type": self.config.ego_view_camera,
-                "device_id": self.config.ego_view_device_id,
-            }
-
-        if self.config.head_camera is not None:
-            camera_configs[CameraMountPosition.HEAD.value] = {
-                "camera_type": self.config.head_camera,
-                "device_id": self.config.head_device_id,
-            }
-
-        if self.config.left_wrist_camera is not None:
-            camera_configs[CameraMountPosition.LEFT_WRIST.value] = {
-                "camera_type": self.config.left_wrist_camera,
-                "device_id": self.config.left_wrist_device_id,
-            }
-
-        if self.config.right_wrist_camera is not None:
-            camera_configs[CameraMountPosition.RIGHT_WRIST.value] = {
-                "camera_type": self.config.right_wrist_camera,
-                "device_id": self.config.right_wrist_device_id,
-            }
-
-        return camera_configs
-
-    def _camera_worker_wrapper(
-        self,
-        mount_position: str,
-        camera_type: str,
-        device_id: Optional[str],
-        image_queue: queue.Queue,
-        shutdown_event: threading.Event,
-        error_event: threading.Event,
-    ):
-        """Worker thread that continuously captures from a single camera"""
+        # Check USB type and adjust FPS for USB 2.x (limited bandwidth)
+        # USB 2.x can't handle 30fps with both color+depth at 640x480
+        rs_fps = self.fps
         try:
-            camera = self._instantiate_camera(mount_position, camera_type, device_id)
-            self._observation_spaces[mount_position] = camera.observation_space()
+            ctx = rs.context()
+            for dev in ctx.query_devices():
+                if dev.get_info(rs.camera_info.serial_number) == self.serial_number:
+                    usb_type = dev.get_info(rs.camera_info.usb_type_descriptor)
+                    if usb_type.startswith("2"):
+                        rs_fps = 15  # Use 15fps for USB 2.x
+                        logger_mp.warning(f'[RealSense] USB {usb_type} detected, reducing to {rs_fps}fps')
+                    break
+        except:
+            pass
 
-            consecutive_failures = 0
-            max_consecutive_failures = 5
+        config.enable_stream(rs.stream.color, self.img_shape[1], self.img_shape[0], rs.format.bgr8, rs_fps)
 
-            while not shutdown_event.is_set():
-                frame = camera.read()
-                if frame:
-                    consecutive_failures = 0  # Reset on successful read
-                    # Non-blocking queue put with frame dropping
-                    try:
-                        image_queue.put_nowait(frame)
-                    except queue.Full:
-                        # Remove oldest frame and add new one
-                        try:
-                            image_queue.get_nowait()
-                            image_queue.put_nowait(frame)
-                        except queue.Empty:
-                            pass
-                else:
-                    consecutive_failures += 1
-                    if consecutive_failures >= max_consecutive_failures:
-                        error_msg = (
-                            f"Camera {mount_position} ({camera_type}) dropped: "
-                            f"failed to read {consecutive_failures} consecutive frames"
-                        )
-                        print(f"[ERROR] {error_msg}")
-                        self.error_messages[mount_position] = error_msg
-                        error_event.set()
-                        break
+        if self.enable_depth:
+            config.enable_stream(rs.stream.depth, self.img_shape[1], self.img_shape[0], rs.format.z16, rs_fps)
 
-            camera.close()
+        logger_mp.info(f'[RealSense] Starting pipeline: {self.img_shape[1]}x{self.img_shape[0]} @ {rs_fps}fps')
+        profile = self.pipeline.start(config)
+        self._device = profile.get_device()
+        if self._device is None:
+            logger_mp.error('[Image Server] pipe_profile.get_device() is None .')
+        if self.enable_depth:
+            assert self._device is not None
+            depth_sensor = self._device.first_depth_sensor()
+            self.g_depth_scale = depth_sensor.get_depth_scale()
 
+        self.intrinsics = profile.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
+
+        # Depth post-processing: spatial (smooth) -> temporal (persist) -> hole_fill
+        self.spatial_filter = rs.spatial_filter() if self.enable_depth else None
+        self.temporal_filter = rs.temporal_filter() if self.enable_depth else None
+        self.hole_filling_filter = rs.hole_filling_filter() if self.enable_depth else None
+        if self.enable_depth:
+            try:
+                # Moderate smoothing: reduces noise/speckle while keeping edges
+                self.spatial_filter.set_option(rs.option.filter_magnitude, 2)
+                self.spatial_filter.set_option(rs.option.filter_smooth_alpha, 0.5)
+                self.spatial_filter.set_option(rs.option.filter_smooth_delta, 20)
+                # Temporal: smooth over frames to reduce flicker
+                self.temporal_filter.set_option(rs.option.filter_smooth_alpha, 0.4)
+                self.temporal_filter.set_option(rs.option.filter_smooth_delta, 20)
+                # Hole fill: 2=nearest_around
+                try:
+                    self.hole_filling_filter.set_option(rs.option.holes_fill, 2)
+                except Exception:
+                    pass
+                logger_mp.info('[RealSense] Depth filters: spatial + temporal + hole_fill')
+            except Exception as e:
+                logger_mp.warning(f'[RealSense] Filter setup: {e}')
+        
+        # Warm-up: discard first frames to stabilize the camera
+        logger_mp.info(f'[RealSense {self.serial_number}] Warming up...')
+        for i in range(10):
+            try:
+                self.pipeline.wait_for_frames(timeout_ms=2000)
+                logger_mp.info(f'[RealSense] Warm-up frame {i} OK')
+            except Exception as e:
+                logger_mp.warning(f'[RealSense] Warm-up frame {i} failed: {e}')
+        logger_mp.info(f'[RealSense {self.serial_number}] Ready')
+
+    def get_frame(self):
+        try:
+            frames = self.pipeline.wait_for_frames(timeout_ms=1000)
         except Exception as e:
-            error_msg = f"Camera {mount_position} ({camera_type}) error: {str(e)}"
-            print(f"[ERROR] {error_msg}")
-            self.error_messages[mount_position] = error_msg
-            error_event.set()
+            logger_mp.warning(f'[RealSense] Frame timeout: {e}')
+            return None, None
+        aligned_frames = self.align.process(frames)
+        color_frame = aligned_frames.get_color_frame()
 
-    def _instantiate_camera(
-        self, mount_position: str, camera_type: str, device_id: Optional[str] = None
-    ) -> Sensor:
+        if self.enable_depth:
+            depth_frame = aligned_frames.get_depth_frame()
+            # Post-process: spatial (smooth) -> temporal (reduce flicker) -> hole_fill
+            if depth_frame and self.spatial_filter:
+                depth_frame = self.spatial_filter.process(depth_frame)
+            if depth_frame and self.temporal_filter:
+                depth_frame = self.temporal_filter.process(depth_frame)
+            if depth_frame and self.hole_filling_filter:
+                depth_frame = self.hole_filling_filter.process(depth_frame)
+
+        if not color_frame:
+            return None
+
+        color_image = np.asanyarray(color_frame.get_data())
+        depth_image = np.asanyarray(depth_frame.get_data()) if self.enable_depth and depth_frame else None
+        return color_image, depth_image
+
+    def release(self):
+        self.pipeline.stop()
+
+
+class OpenCVCamera():
+    def __init__(self, device_id, img_shape, fps):
         """
-        Instantiate a camera sensor based on the camera type.
-
-        Args:
-            camera_type: Type of camera ("oak", "oak_mono", "realsense", "zed")
-            device_id: Optional device ID for the camera (used for OAK cameras)
-
-        Returns:
-            Sensor instance for the specified camera type
+        decive_id: /dev/video* or *
+        img_shape: [height, width]
         """
-        if camera_type in ("oak", "oak_mono"):
-            from decoupled_wbc.control.sensor.oak import OAKConfig, OAKSensor
+        self.id = device_id
+        self.fps = fps
+        self.img_shape = img_shape
+        self.cap = cv2.VideoCapture(self.id, cv2.CAP_V4L2)
+        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter.fourcc('M', 'J', 'P', 'G'))
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.img_shape[0])
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH,  self.img_shape[1])
+        self.cap.set(cv2.CAP_PROP_FPS, self.fps)
 
-            oak_config = OAKConfig()
-            if camera_type == "oak_mono":
-                oak_config.enable_mono_cameras = True
-            print("Initializing OAK sensor for camera type: ", camera_type)
-            return OAKSensor(config=oak_config, mount_position=mount_position, device_id=device_id)
-        elif camera_type == "realsense":
-            from decoupled_wbc.control.sensor.realsense import RealSenseSensor
+        # Test if the camera can read frames
+        if not self._can_read_frame():
+            logger_mp.error(f"[Image Server] Camera {self.id} Error: Failed to initialize the camera or read frames. Exiting...")
+            self.release()
 
-            print("Initializing RealSense sensor for camera type: ", camera_type)
-            return RealSenseSensor(mount_position=mount_position)
-        elif camera_type == "zed":
-            from decoupled_wbc.control.sensor.zed import ZEDSensor
+    def _can_read_frame(self):
+        success, _ = self.cap.read()
+        return success
 
-            print("Initializing ZED sensor for camera type: ", camera_type)
-            return ZEDSensor(mount_position=mount_position)
-        elif camera_type.endswith(".mp4"):
-            from decoupled_wbc.control.sensor.dummy import ReplayDummySensor
+    def release(self):
+        self.cap.release()
 
-            print("Initializing Replay Dummy Sensor for camera type: ", camera_type)
-            return ReplayDummySensor(video_path=camera_type)
+    def get_frame(self):
+        ret, color_image = self.cap.read()
+        if not ret:
+            return None
+        return color_image
+
+
+class ImageServer:
+    def __init__(self, config, port = 5555, Unit_Test = False):
+        """
+        config example1:
+        {
+            'fps':30                                                          # frame per second
+            'head_camera_type': 'opencv',                                     # opencv or realsense
+            'head_camera_image_shape': [480, 1280],                           # Head camera resolution  [height, width]
+            'head_camera_id_numbers': [0],                                    # '/dev/video0' (opencv)
+            'wrist_camera_type': 'realsense', 
+            'wrist_camera_image_shape': [480, 640],                           # Wrist camera resolution  [height, width]
+            'wrist_camera_id_numbers': ["218622271789", "241222076627"],      # realsense camera's serial number
+        }
+
+        config example2:
+        {
+            'fps':30                                                          # frame per second
+            'head_camera_type': 'realsense',                                  # opencv or realsense
+            'head_camera_image_shape': [480, 640],                            # Head camera resolution  [height, width]
+            'head_camera_id_numbers': ["218622271739"],                       # realsense camera's serial number
+            'wrist_camera_type': 'opencv', 
+            'wrist_camera_image_shape': [480, 640],                           # Wrist camera resolution  [height, width]
+            'wrist_camera_id_numbers': [0,1],                                 # '/dev/video0' and '/dev/video1' (opencv)
+        }
+
+        If you are not using the wrist camera, you can comment out its configuration, like this below:
+        config:
+        {
+            'fps':30                                                          # frame per second
+            'head_camera_type': 'opencv',                                     # opencv or realsense
+            'head_camera_image_shape': [480, 1280],                           # Head camera resolution  [height, width]
+            'head_camera_id_numbers': [0],                                    # '/dev/video0' (opencv)
+            #'wrist_camera_type': 'realsense', 
+            #'wrist_camera_image_shape': [480, 640],                           # Wrist camera resolution  [height, width]
+            #'wrist_camera_id_numbers': ["218622271789", "241222076627"],      # serial number (realsense)
+        }
+        """
+        logger_mp.info(config)
+        self.fps = config.get('fps', 30)
+        self.head_camera_type = config.get('head_camera_type', 'opencv')
+        self.head_image_shape = config.get('head_camera_image_shape', [480, 640])      # (height, width)
+        self.head_camera_id_numbers = config.get('head_camera_id_numbers', [0])
+
+        self.wrist_camera_type = config.get('wrist_camera_type', None)
+        self.wrist_image_shape = config.get('wrist_camera_image_shape', [480, 640])    # (height, width)
+        self.wrist_camera_id_numbers = config.get('wrist_camera_id_numbers', None)
+
+        self.port = port
+        self.Unit_Test = Unit_Test
+        self.depth_near_mm = config.get('depth_near_mm', 250)
+        self.depth_far_mm = config.get('depth_far_mm', 4000)
+        self.depth_style = config.get('depth_style', '3ddp')  # 3ddp, turbo, jet
+
+        # Initialize head cameras
+        self.head_cameras = []
+        self.enable_depth = config.get('enable_depth', False)
+        if self.head_camera_type == 'opencv':
+            for device_id in self.head_camera_id_numbers:
+                camera = OpenCVCamera(device_id=device_id, img_shape=self.head_image_shape, fps=self.fps)
+                self.head_cameras.append(camera)
+        elif self.head_camera_type == 'realsense':
+            for serial_number in self.head_camera_id_numbers:
+                camera = RealSenseCamera(img_shape=self.head_image_shape, fps=self.fps, serial_number=serial_number, enable_depth=self.enable_depth)
+                self.head_cameras.append(camera)
         else:
-            raise ValueError(f"Unsupported camera type: {camera_type}")
+            logger_mp.warning(f"[Image Server] Unsupported head_camera_type: {self.head_camera_type}")
 
-    def _check_for_errors(self):
-        """Check if any camera thread has encountered an error and raise exception if so."""
-        for mount_position, error_event in self.error_events.items():
-            if error_event.is_set():
-                error_msg = self.error_messages.get(
-                    mount_position, f"Camera {mount_position} encountered an unknown error"
-                )
-                raise RuntimeError(error_msg)
+        # Initialize wrist cameras if provided
+        self.wrist_cameras = []
+        if self.wrist_camera_type and self.wrist_camera_id_numbers:
+            if self.wrist_camera_type == 'opencv':
+                for device_id in self.wrist_camera_id_numbers:
+                    camera = OpenCVCamera(device_id=device_id, img_shape=self.wrist_image_shape, fps=self.fps)
+                    self.wrist_cameras.append(camera)
+            elif self.wrist_camera_type == 'realsense':
+                for serial_number in self.wrist_camera_id_numbers:
+                    camera = RealSenseCamera(img_shape=self.wrist_image_shape, fps=self.fps, serial_number=serial_number)
+                    self.wrist_cameras.append(camera)
+            else:
+                logger_mp.warning(f"[Image Server] Unsupported wrist_camera_type: {self.wrist_camera_type}")
 
-    def read(self):
-        """Read frames from all cameras."""
-        # Check for errors from camera threads
-        self._check_for_errors()
+        # Set ZeroMQ context and socket
+        self.context = zmq.Context()
+        self.socket = self.context.socket(zmq.PUB)
+        self.socket.bind(f"tcp://*:{self.port}")
 
-        message = {}
-        for mount_position, camera_queue in self.camera_queues.items():
-            frame = self._get_latest_from_queue(camera_queue)
-            if frame is not None:
-                message[mount_position] = frame
-        return message
+        if self.Unit_Test:
+            self._init_performance_metrics()
 
-    def _get_latest_from_queue(self, camera_queue: queue.Queue) -> Optional[Dict[str, Any]]:
-        """Get most recent frame, discard older ones"""
-        latest = None
+        for cam in self.head_cameras:
+            if isinstance(cam, OpenCVCamera):
+                logger_mp.info(f"[Image Server] Head camera {cam.id} resolution: {cam.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)} x {cam.cap.get(cv2.CAP_PROP_FRAME_WIDTH)}")
+            elif isinstance(cam, RealSenseCamera):
+                logger_mp.info(f"[Image Server] Head camera {cam.serial_number} resolution: {cam.img_shape[0]} x {cam.img_shape[1]}")
+            else:
+                logger_mp.warning("[Image Server] Unknown camera type in head_cameras.")
+
+        for cam in self.wrist_cameras:
+            if isinstance(cam, OpenCVCamera):
+                logger_mp.info(f"[Image Server] Wrist camera {cam.id} resolution: {cam.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)} x {cam.cap.get(cv2.CAP_PROP_FRAME_WIDTH)}")
+            elif isinstance(cam, RealSenseCamera):
+                logger_mp.info(f"[Image Server] Wrist camera {cam.serial_number} resolution: {cam.img_shape[0]} x {cam.img_shape[1]}")
+            else:
+                logger_mp.warning("[Image Server] Unknown camera type in wrist_cameras.")
+
+        logger_mp.info("[Image Server] Image server has started, waiting for client connections...")
+
+
+
+    def _init_performance_metrics(self):
+        self.frame_count = 0  # Total frames sent
+        self.time_window = 1.0  # Time window for FPS calculation (in seconds)
+        self.frame_times = deque()  # Timestamps of frames sent within the time window
+        self.start_time = time.time()  # Start time of the streaming
+
+    def _update_performance_metrics(self, current_time):
+        # Add current time to frame times deque
+        self.frame_times.append(current_time)
+        # Remove timestamps outside the time window
+        while self.frame_times and self.frame_times[0] < current_time - self.time_window:
+            self.frame_times.popleft()
+        # Increment frame count
+        self.frame_count += 1
+
+    def _print_performance_metrics(self, current_time):
+        if self.frame_count % 30 == 0:
+            elapsed_time = current_time - self.start_time
+            real_time_fps = len(self.frame_times) / self.time_window
+            logger_mp.info(f"[Image Server] Real-time FPS: {real_time_fps:.2f}, Total frames sent: {self.frame_count}, Elapsed time: {elapsed_time:.2f} sec")
+
+    def _close(self):
+        for cam in self.head_cameras:
+            cam.release()
+        for cam in self.wrist_cameras:
+            cam.release()
+        self.socket.close()
+        self.context.term()
+        logger_mp.info("[Image Server] The server has been closed.")
+
+    def send_process(self):
         try:
             while True:
-                latest = camera_queue.get_nowait()
-        except queue.Empty:
-            pass
-        return latest
+                head_frames = []
+                raw_depth_image = None
+                camera_frames = {}
+                camera_timestamps = {}
+                frame_time = time.time()
 
-    def close(self):
-        """Close all cameras."""
-        # Signal all worker threads to shutdown
-        for shutdown_event in self.shutdown_events.values():
-            shutdown_event.set()
+                for cam in self.head_cameras:
+                    if self.head_camera_type == 'opencv':
+                        color_image = cam.get_frame()
+                        if color_image is None:
+                            logger_mp.error("[Image Server] Head camera frame read is error.")
+                            break
+                        head_frames.append(color_image)
+                        camera_frames['ego_view'] = color_image
+                        camera_timestamps['ego_view'] = frame_time
+                    elif self.head_camera_type == 'realsense':
+                        result = cam.get_frame()
+                        if result is None or result[0] is None:
+                            logger_mp.error("[Image Server] Head camera frame read is error.")
+                            break
+                        color_image, depth_image = result
+                        head_frames.append(color_image)
+                        camera_frames['ego_view'] = color_image
+                        camera_timestamps['ego_view'] = frame_time
+                        if depth_image is not None:
+                            raw_depth_image = depth_image.copy()
+                            depth_colormap = _depth_to_display(
+                                depth_image,
+                                near_mm=self.depth_near_mm,
+                                far_mm=self.depth_far_mm,
+                                style=self.depth_style,
+                            )
+                            head_frames.append(depth_colormap)
+                if not head_frames:
+                    break
+                head_color = cv2.hconcat(head_frames)
 
-        # Wait for all threads to finish
-        for thread in self.camera_threads.values():
-            thread.join(timeout=5.0)
+                if self.wrist_cameras:
+                    wrist_frames = []
+                    wrist_ok = True
+                    for i, cam in enumerate(self.wrist_cameras):
+                        if self.wrist_camera_type == 'opencv':
+                            color_image = cam.get_frame()
+                            if color_image is None:
+                                logger_mp.warning("[Image Server] Wrist camera frame read failed, skipping wrist.")
+                                wrist_ok = False
+                                break
+                        elif self.wrist_camera_type == 'realsense':
+                            color_image, _depth = cam.get_frame()
+                            if color_image is None:
+                                logger_mp.warning("[Image Server] Wrist camera frame read failed, skipping wrist.")
+                                wrist_ok = False
+                                break
+                        wrist_frames.append(color_image)
+                        wrist_name = 'right_wrist' if i == 0 else f'wrist_{i}'
+                        camera_frames[wrist_name] = color_image
+                        camera_timestamps[wrist_name] = frame_time
 
-        # Clear queues
-        for camera_queue in self.camera_queues.values():
-            try:
-                while True:
-                    camera_queue.get_nowait()
-            except queue.Empty:
-                pass
+                    if wrist_ok and wrist_frames:
+                        wrist_color = cv2.hconcat(wrist_frames)
+                        full_color = cv2.hconcat([head_color, wrist_color])
+                    else:
+                        full_color = head_color
+                else:
+                    full_color = head_color
 
-        # Stop server if running
-        if self.config.run_as_server:
-            self.stop_server()
+                ret, buffer = cv2.imencode('.jpg', full_color)
+                if not ret:
+                    logger_mp.error("[Image Server] Frame imencode is failed.")
+                    continue
 
-    def serialize_message(self, message: Dict[str, Any]) -> Dict[str, Any]:
-        """Merge all camera data into a single ImageMessageSchema."""
-        all_timestamps = {}
-        all_images = {}
+                jpg_bytes = buffer.tobytes()
 
-        for _, camera_data in message.items():
-            all_timestamps.update(camera_data.get("timestamps", {}))
-            all_images.update(camera_data.get("images", {}))
+                # JPEG-encode individual camera frames for data collection
+                camera_frames_jpg = {}
+                for name, frame in camera_frames.items():
+                    ok, buf = cv2.imencode('.jpg', frame)
+                    if ok:
+                        camera_frames_jpg[name] = buf.tobytes()
 
-        # Create a single ImageMessageSchema with all data
-        img_schema = ImageMessageSchema(timestamps=all_timestamps, images=all_images)
-        return img_schema.serialize()
+                message_data = {
+                    'image': jpg_bytes,
+                    'depth_raw': raw_depth_image,
+                    'camera_frames': camera_frames_jpg,
+                    'camera_timestamps': camera_timestamps,
+                }
+                message = pickle.dumps(message_data)
 
-    def run_server(self):
-        """Run the server."""
-        idx = 0
-        server_start_time = time.monotonic()
-        fps_print_time = time.monotonic()
-        frame_interval = 1.0 / self.config.fps
+                self.socket.send(message)
 
+                if self.Unit_Test:
+                    current_time = time.time()
+                    self._update_performance_metrics(current_time)
+                    self._print_performance_metrics(current_time)
+
+        except KeyboardInterrupt:
+            logger_mp.warning("[Image Server] Interrupted by user.")
+        finally:
+            self._close()
+
+
+class ComposedCameraClientSensor:
+    """ZMQ client that receives camera frames from ImageServer.
+
+    Returns data in the format expected by the data exporter:
+        {"images": {"ego_view": np.ndarray, ...}, "timestamps": {"ego_view": float, ...}}
+    """
+
+    def __init__(self, server_ip="localhost", port=5555):
+        self._context = zmq.Context()
+        self._socket = self._context.socket(zmq.SUB)
+        self._socket.connect(f"tcp://{server_ip}:{port}")
+        self._socket.setsockopt_string(zmq.SUBSCRIBE, "")
+        self._latest_message = None
+        logger_mp.info(f"[CameraClient] Connected to tcp://{server_ip}:{port}")
+
+    def read(self):
+        """Non-blocking receive of latest camera frame.
+
+        Drains the ZMQ queue and returns only the most recent message
+        to avoid stale frames building up.
+        """
+        latest_raw = None
         while True:
-            # Calculate when this frame should ideally complete
-            target_time = server_start_time + (idx + 1) * frame_interval
+            try:
+                latest_raw = self._socket.recv(zmq.NOBLOCK)
+            except zmq.Again:
+                break
 
-            message = self.read()
-            if message:
-                if self.config.test_latency:
-                    read_qr_code(message)
+        if latest_raw is None:
+            return self._latest_message
 
-                serialized_message = self.serialize_message(message)
-                self.send_message(serialized_message)
-                idx += 1
+        try:
+            data = pickle.loads(latest_raw)
+        except Exception:
+            return self._latest_message
 
-                if idx % 10 == 0:
-                    print(f"Image sending FPS: {10 / (time.monotonic() - fps_print_time):.2f}")
-                    fps_print_time = time.monotonic()
+        if not isinstance(data, dict):
+            return self._latest_message
 
-            # Sleep to maintain precise timing
-            current_time = time.monotonic()
-            sleep_time = target_time - current_time
-            if sleep_time > 0:
-                time.sleep(sleep_time)
-            else:
-                # If we're behind, increment idx to stay on schedule
-                if not message:
-                    idx += 1
+        camera_frames_jpg = data.get('camera_frames', {})
+        camera_timestamps = data.get('camera_timestamps', {})
 
-    def observation_space(self):
-        """Return the observation space."""
-        import gymnasium as gym
+        if not camera_frames_jpg:
+            return self._latest_message
 
-        return gym.spaces.Dict(self._observation_spaces)
+        images = {}
+        for name, jpg_bytes in camera_frames_jpg.items():
+            np_buf = np.frombuffer(jpg_bytes, dtype=np.uint8)
+            img = cv2.imdecode(np_buf, cv2.IMREAD_COLOR)
+            if img is not None:
+                images[name] = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
-
-class ComposedCameraClientSensor(Sensor, SensorClient):
-    """Class that serves as client for multiple different cameras."""
-
-    def __init__(self, server_ip: str = "localhost", port: int = 5555):
-        self.start_client(server_ip, port)
-
-        # Initialize tracking variables
-        self._latest_message = {}
-        self._avg_time_per_frame = deque(maxlen=20)
-        self._msg_received_time = 0
-        self._start_time = 0.0  # Initialize _start_time
-        self.idx = 0
-
-        print("Initialized composed camera client sensor")
-
-    def read(self, **kwargs) -> Optional[Dict[str, Any]]:
-        self._start_time = time.time()
-        message = self.receive_message()
-        if not message:
-            return None
-        self.idx += 1
-
-        self._latest_message = ImageMessageSchema.deserialize(message).asdict()
-
-        # if self.idx % 10 == 0:
-        #     for image_key, image_time in self._latest_message["timestamps"].items():
-        #         image_latency = (time.time() - image_time) * 1000
-        # print(f"Image latency for {image_key}: {image_latency:.2f} ms")
-
-        self._msg_received_time = time.time()
-        self._avg_time_per_frame.append(self._msg_received_time - self._start_time)
+        if images:
+            self._latest_message = {"images": images, "timestamps": camera_timestamps}
 
         return self._latest_message
 
     def close(self):
-        """Close the client connection."""
-        self.stop_client()
+        self._socket.close()
+        self._context.term()
 
-    def fps(self) -> float:
-        """Get the current FPS of the client."""
-        if len(self._avg_time_per_frame) == 0:
-            return 0.0
-        return float(1 / np.mean(self._avg_time_per_frame))
+    def fps(self):
+        return 0.0
 
 
 if __name__ == "__main__":
-    """Test function for ComposedCamera."""
-    import tyro
-
-    config = tyro.cli(ComposedCameraConfig)
-
-    if config.run_as_server:
-        composed_camera = ComposedCameraSensor(config)
-        print("Running composed camera server...")
-        composed_camera.run_server()
-
-    else:
-        # Client mode
-        composed_client = ComposedCameraClientSensor(server_ip="localhost", port=config.port)
-
-        try:
-            while True:
-                data = composed_client.read()
-                if data is not None:
-                    print(f"FPS: {composed_client.fps():.2f}")
-                    if "timestamp" in data:
-                        print(f"Timestamp: {data['timestamp']}")
-                time.sleep(0.1)
-        except KeyboardInterrupt:
-            print("Stopping client...")
-            composed_client.close()
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--wrist', type=int, nargs='+', default=[], help='Wrist camera ports (empty or -1 to disable)')
+    parser.add_argument('--no-depth', action='store_true', help='Disable depth')
+    parser.add_argument('--no-wrist', action='store_true', help='Disable wrist cameras')
+    parser.add_argument('--depth-near', type=int, default=250, help='Depth near plane (mm)')
+    parser.add_argument('--depth-far', type=int, default=4000, help='Depth far plane (mm)')
+    parser.add_argument('--depth-style', type=str, default='turbo', choices=['3ddp', 'turbo', 'jet'],
+                        help='3ddp=3D-Diffusion-Policy style (u,v,depth as RGB), turbo/jet=colormap')
+    parser.add_argument('--resolution', type=str, default='640x480', help='Width x height')
+    args = parser.parse_args()
+    
+    # Auto-detect RealSense
+    ctx = rs.context()
+    devices = ctx.query_devices()
+    if len(devices) == 0:
+        print("ERROR: No RealSense camera found!")
+        exit(1)
+    serial = devices[0].get_info(rs.camera_info.serial_number)
+    print(f"[AUTO] RealSense: {serial}")
+    
+    # Handle wrist camera config
+    wrist_ports = args.wrist
+    if args.no_wrist or wrist_ports == [-1]:
+        wrist_ports = []
+    
+    # Parse resolution
+    try:
+        w, h = map(int, args.resolution.lower().split('x'))
+        img_shape = [h, w]  # [height, width]
+    except Exception:
+        img_shape = [480, 640]
+        logger_mp.warning(f'[CONFIG] Invalid --resolution "{args.resolution}", using 640x480')
+    
+    config = {
+        'fps': 30,
+        'head_camera_type': 'realsense',
+        'head_camera_image_shape': img_shape,
+        'head_camera_id_numbers': [serial],
+        'enable_depth': not args.no_depth,
+        'depth_near_mm': args.depth_near,
+        'depth_far_mm': args.depth_far,
+        'depth_style': args.depth_style,
+    }
+    
+    # Only add wrist config if wrist cameras specified
+    if wrist_ports:
+        config['wrist_camera_type'] = 'opencv'
+        config['wrist_camera_image_shape'] = img_shape
+        config['wrist_camera_id_numbers'] = wrist_ports
+    
+    print(f"[CONFIG] Resolution: {config['head_camera_image_shape'][1]}x{config['head_camera_image_shape'][0]}")
+    print(f"[CONFIG] Head: RealSense RGB + {'Depth' if config['enable_depth'] else 'No Depth'}")
+    if config['enable_depth']:
+        print(f"[CONFIG] Depth: {config['depth_near_mm']}-{config['depth_far_mm']}mm, style={config['depth_style']}")
+    print(f"[CONFIG] Wrist: {wrist_ports if wrist_ports else 'DISABLED'}")
+    
+    server = ImageServer(config, Unit_Test=False)
+    server.send_process()

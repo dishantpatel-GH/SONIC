@@ -362,6 +362,7 @@ fi
 docker run -it --rm \
     --name "$IMAGE_NAME" \
     --network host \
+    --ipc=host \
     $GPU_SETTINGS \
     -v "$(cd .. && pwd):/workspace/g1_deploy:rw" \
     $TENSORRT_MOUNT \

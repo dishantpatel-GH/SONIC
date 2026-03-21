@@ -8,6 +8,10 @@ LOCO_NAV_TASK_STATUS_TOPIC = "NavigationPolicy/task_status"
 LOWER_BODY_POLICY_STATUS_TOPIC = "ControlPolicy/lower_body_policy_status"
 JOINT_SAFETY_STATUS_TOPIC = "ControlPolicy/joint_safety_status"
 
+# --- Add Inspire Hand Topics Here ---
+INSPIRE_HAND_CMD_TOPIC = "rt/inspire/cmd"
+INSPIRE_HAND_STATE_TOPIC = "rt/inspire/state"
+# ------------------------------------
 
 DEFAULT_NAV_CMD = [0.0, 0.0, 0.0]
 DEFAULT_BASE_HEIGHT = 0.74
