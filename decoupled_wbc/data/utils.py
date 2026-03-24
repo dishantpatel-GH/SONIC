@@ -67,7 +67,10 @@ def get_modality_config(robot_model: RobotModel, add_stereo_camera: bool = False
             },
             "navigate_command": {"start": 0, "end": 3, "original_key": "teleop.navigate_command"},
         },
-        "video": {"ego_view": {"original_key": "observation.images.ego_view"}},
+        "video": {
+            "ego_view": {"original_key": "observation.images.ego_view"},
+            "right_wrist": {"original_key": "observation.images.right_wrist"},
+        },
         "annotation": {"human.task_description": {"original_key": "task_index"}},
     }
     if add_stereo_camera:
@@ -87,6 +90,11 @@ def get_dataset_features(robot_model: RobotModel, add_stereo_camera: bool = Fals
     """
     dataset_features = {
         "observation.images.ego_view": {
+            "dtype": "video",
+            "shape": [RS_VIEW_CAMERA_HEIGHT, RS_VIEW_CAMERA_WIDTH, 3],
+            "names": ["height", "width", "channel"],
+        },
+        "observation.images.right_wrist": {
             "dtype": "video",
             "shape": [RS_VIEW_CAMERA_HEIGHT, RS_VIEW_CAMERA_WIDTH, 3],
             "names": ["height", "width", "channel"],

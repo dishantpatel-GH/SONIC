@@ -103,9 +103,12 @@ class ROSMsgSubscriber:
     Subscribes to any topics published by a ROSMsgPublisher.
     """
 
-    def __init__(self, topic_name: str):
-        ros_manager = ROSManager()
-        self.node = ros_manager.node
+    def __init__(self, topic_name: str, node=None):
+        if node is not None:
+            self.node = node
+        else:
+            ros_manager = ROSManager()
+            self.node = ros_manager.node
         self._msg = None
         self.subscription = self.node.create_subscription(
             ByteMultiArray, topic_name, self._callback, 1

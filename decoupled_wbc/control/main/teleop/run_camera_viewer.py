@@ -264,7 +264,7 @@ class ImageClient:
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Camera stream viewer")
-    parser.add_argument('--host', type=str, default='localhost',
+    parser.add_argument('--host', type=str, default='192.168.123.164',
                         help='Camera server address (default: localhost)')
     parser.add_argument('--port', type=int, default=5555,
                         help='Camera server port (default: 5555)')

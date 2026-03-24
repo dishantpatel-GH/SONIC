@@ -1,3 +1,7 @@
+import select
+import sys
+import termios
+import tty
 from collections import deque
 from datetime import datetime
 import threading
@@ -12,8 +16,23 @@ from decoupled_wbc.control.main.teleop.configs.configs import DataExporterConfig
 from decoupled_wbc.control.robot_model.instantiation import g1
 from decoupled_wbc.control.sensor.composed_camera import ComposedCameraClientSensor
 from decoupled_wbc.control.utils.episode_state import EpisodeState
-from decoupled_wbc.control.utils.keyboard_dispatcher import KeyboardListenerSubscriber
 from decoupled_wbc.control.utils.ros_utils import ROSMsgSubscriber
+
+
+class StdinKeyboardReader:
+    """Non-blocking stdin keyboard reader using raw terminal mode."""
+
+    def __init__(self):
+        self._old_settings = termios.tcgetattr(sys.stdin)
+        tty.setcbreak(sys.stdin.fileno())
+
+    def read_msg(self):
+        if select.select([sys.stdin], [], [], 0)[0]:
+            return sys.stdin.read(1)
+        return None
+
+    def close(self):
+        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self._old_settings)
 from decoupled_wbc.control.utils.telemetry import Telemetry
 from decoupled_wbc.control.utils.text_to_speech import TextToSpeech
 from decoupled_wbc.data.constants import BUCKET_BASE_PATH
@@ -96,8 +115,9 @@ class Gr00tDataCollector:
         time.sleep(0.5)
 
         self._episode_state = EpisodeState()
-        self._keyboard_listener = KeyboardListenerSubscriber()
-        self._state_subscriber = ROSMsgSubscriber(state_topic_name)
+        self._keyboard_listener = StdinKeyboardReader()
+        print("[INFO] Keyboard controls: 'c' = start/stop recording, 'x' = discard episode, Ctrl+C = quit")
+        self._state_subscriber = ROSMsgSubscriber(state_topic_name, node=self.node)
         self._image_subscriber = ComposedCameraClientSensor(server_ip=camera_host, port=camera_port)
         self.rate = self.node.create_rate(self.frequency)
 
@@ -152,52 +172,82 @@ class Gr00tDataCollector:
             )
             return False
 
+        # Debug: print proprio message keys once
+        if not hasattr(self, '_debug_printed'):
+            print(f"[DEBUG] proprio msg keys: {list(self.latest_proprio_msg.keys())}")
+            self._debug_printed = True
+
         if self._episode_state.get_state() == self._episode_state.RECORDING:
 
-            # observation.state and action include full robot joints (arms, hands, etc.).
-            # When hand_type is "inspire", Inspire hand joint positions/commands are included.
-            # Calculate max time delta between images and proprio
+            proprio = self.latest_proprio_msg
+
+            # Compute image-proprio time delta
+            # C++ deploy uses ros_timestamp; image uses camera_timestamps
             max_time_delta = 0
+            proprio_time = proprio.get("ros_timestamp", time.time())
             for _, image_time in self.latest_image_msg["timestamps"].items():
-                time_delta = abs(image_time - self.latest_proprio_msg["timestamps"]["proprio"])
+                time_delta = abs(image_time - proprio_time)
                 max_time_delta = max(max_time_delta, time_delta)
 
             self.timing_threshold_monitor.log_time_delta(max_time_delta)
             if (self.timing_threshold_monitor.failure_count + 1) % 100 == 0:
                 self._print_and_say("Image state delta too high, please discard data")
 
+            # Build full joint state matching URDF order.
+            # C++ deploy sends 6 actuated DOF per hand (proximal joints only).
+            # URDF has 12 per hand (proximal + coupled intermediate/distal).
+            # Expand: duplicate each proximal value for its coupled joint.
+            # URDF hand order: thumb_yaw, thumb_pitch, thumb_inter, thumb_distal,
+            #   index_prox, index_inter, middle_prox, middle_inter,
+            #   ring_prox, ring_inter, pinky_prox, pinky_inter
+            # Deploy hand order: thumb_yaw, thumb_pitch, index, middle, ring, pinky
+            def expand_hand_6_to_12(hand_6):
+                """Expand 6 actuated hand DOFs to 12 URDF DOFs (proximal + coupled)."""
+                h = np.array(hand_6, dtype=np.float64)
+                if len(h) < 6:
+                    h = np.zeros(6, dtype=np.float64)
+                return np.array([
+                    h[0], h[1], h[1], h[1],  # thumb: yaw, pitch, inter(=pitch), distal(=pitch)
+                    h[2], h[2],               # index: prox, inter(=prox)
+                    h[3], h[3],               # middle: prox, inter(=prox)
+                    h[4], h[4],               # ring: prox, inter(=prox)
+                    h[5], h[5],               # pinky: prox, inter(=prox)
+                ], dtype=np.float64)
+
+            body_q = np.array(proprio.get("body_q", []), dtype=np.float64)
+            left_hand_q = expand_hand_6_to_12(proprio.get("left_hand_q", []))
+            right_hand_q = expand_hand_6_to_12(proprio.get("right_hand_q", []))
+            full_q = np.concatenate([body_q, left_hand_q, right_hand_q])
+
+            last_action = np.array(proprio.get("last_action", []), dtype=np.float64)
+            last_lh_action = expand_hand_6_to_12(proprio.get("last_left_hand_action", []))
+            last_rh_action = expand_hand_6_to_12(proprio.get("last_right_hand_action", []))
+            full_action = np.concatenate([last_action, last_lh_action, last_rh_action])
+
+            # eef_state placeholder (C++ deploy doesn't provide wrist poses directly)
+            eef_state = np.zeros(14, dtype=np.float64)
+
             frame_data = {
-                "observation.state": self.latest_proprio_msg["q"],
-                "observation.eef_state": self.latest_proprio_msg["wrist_pose"],
-                "action": self.latest_proprio_msg["action"],
-                "action.eef": self.latest_proprio_msg["action.eef"],
-                "observation.img_state_delta": (
-                    np.array(
-                        [max_time_delta],
-                        dtype=np.float32,
-                    )
-                ),  # lerobot only supports adding numpy arrays
-                "teleop.navigate_command": np.array(
-                    self.latest_proprio_msg["navigate_command"], dtype=np.float64
-                ),
-                "teleop.base_height_command": np.array(
-                    [self.latest_proprio_msg["base_height_command"]], dtype=np.float64
-                ),
+                "observation.state": full_q,
+                "observation.eef_state": eef_state,
+                "action": full_action,
+                "action.eef": eef_state,
+                "observation.img_state_delta": np.array([max_time_delta], dtype=np.float32),
+                "teleop.navigate_command": np.zeros(3, dtype=np.float64),
+                "teleop.base_height_command": np.array([0.74], dtype=np.float64),
             }
 
-            # Add images based on dataset features
+            # Add images based on dataset features (skip missing optional cameras)
             images = self.latest_image_msg["images"]
             for feature_name, feature_info in self.data_exporter.features.items():
                 if feature_info.get("dtype") in ["image", "video"]:
-                    # Extract image key from feature name (e.g., "observation.images.ego_view" -> "ego_view")
                     image_key = feature_name.split(".")[-1]
-
-                    if image_key not in images:
-                        raise ValueError(
-                            f"Required image '{image_key}' for feature '{feature_name}' "
-                            f"not found in image message. Available images: {list(images.keys())}"
-                        )
-                    frame_data[feature_name] = images[image_key]
+                    if image_key in images:
+                        frame_data[feature_name] = images[image_key]
+                    else:
+                        # Fill missing camera with black frame
+                        h, w = feature_info["shape"][0], feature_info["shape"][1]
+                        frame_data[feature_name] = np.zeros((h, w, 3), dtype=np.uint8)
 
             self.data_exporter.add_frame(frame_data)
 
@@ -224,6 +274,7 @@ class Gr00tDataCollector:
         except Exception as e:
             self._print_and_say(f"Error saving episode: {e}")
 
+        self._keyboard_listener.close()
         self.node.destroy_node()
         rclpy.shutdown()
         self._print_and_say("Shutting down data exporter...", say=False)

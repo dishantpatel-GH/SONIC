@@ -5,7 +5,10 @@ import struct
 import pickle
 from collections import deque
 import numpy as np
-import pyrealsense2 as rs
+try:
+    import pyrealsense2 as rs
+except ImportError:
+    rs = None
 import logging
 
 try:
@@ -489,61 +492,42 @@ class ComposedCameraClientSensor:
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--wrist', type=int, nargs='+', default=[], help='Wrist camera ports (empty or -1 to disable)')
-    parser.add_argument('--no-depth', action='store_true', help='Disable depth')
-    parser.add_argument('--no-wrist', action='store_true', help='Disable wrist cameras')
-    parser.add_argument('--depth-near', type=int, default=250, help='Depth near plane (mm)')
-    parser.add_argument('--depth-far', type=int, default=4000, help='Depth far plane (mm)')
-    parser.add_argument('--depth-style', type=str, default='turbo', choices=['3ddp', 'turbo', 'jet'],
-                        help='3ddp=3D-Diffusion-Policy style (u,v,depth as RGB), turbo/jet=colormap')
-    parser.add_argument('--resolution', type=str, default='640x480', help='Width x height')
+    parser = argparse.ArgumentParser(description="Camera streaming server (Arduino/OpenCV cameras)")
+    parser.add_argument('--head', type=int, default=0, help='Head camera /dev/video device ID (default: 0)')
+    parser.add_argument('--wrist', type=int, default=None, help='Right wrist camera /dev/video device ID (default: None = disabled)')
+    parser.add_argument('--no-wrist', action='store_true', help='Disable wrist camera')
+    parser.add_argument('--resolution', type=str, default='640x480', help='Width x height (default: 640x480)')
+    parser.add_argument('--fps', type=int, default=30, help='Frames per second (default: 30)')
+    parser.add_argument('--port', type=int, default=5555, help='ZMQ publish port (default: 5555)')
     args = parser.parse_args()
-    
-    # Auto-detect RealSense
-    ctx = rs.context()
-    devices = ctx.query_devices()
-    if len(devices) == 0:
-        print("ERROR: No RealSense camera found!")
-        exit(1)
-    serial = devices[0].get_info(rs.camera_info.serial_number)
-    print(f"[AUTO] RealSense: {serial}")
-    
-    # Handle wrist camera config
-    wrist_ports = args.wrist
-    if args.no_wrist or wrist_ports == [-1]:
-        wrist_ports = []
-    
+
     # Parse resolution
     try:
         w, h = map(int, args.resolution.lower().split('x'))
         img_shape = [h, w]  # [height, width]
     except Exception:
         img_shape = [480, 640]
-        logger_mp.warning(f'[CONFIG] Invalid --resolution "{args.resolution}", using 640x480')
-    
+        print(f'[CONFIG] Invalid --resolution "{args.resolution}", using 640x480')
+
     config = {
-        'fps': 30,
-        'head_camera_type': 'realsense',
+        'fps': args.fps,
+        'head_camera_type': 'opencv',
         'head_camera_image_shape': img_shape,
-        'head_camera_id_numbers': [serial],
-        'enable_depth': not args.no_depth,
-        'depth_near_mm': args.depth_near,
-        'depth_far_mm': args.depth_far,
-        'depth_style': args.depth_style,
+        'head_camera_id_numbers': [args.head],
     }
-    
-    # Only add wrist config if wrist cameras specified
-    if wrist_ports:
+
+    # Add right wrist camera if specified
+    if args.wrist is not None and not args.no_wrist:
         config['wrist_camera_type'] = 'opencv'
         config['wrist_camera_image_shape'] = img_shape
-        config['wrist_camera_id_numbers'] = wrist_ports
-    
-    print(f"[CONFIG] Resolution: {config['head_camera_image_shape'][1]}x{config['head_camera_image_shape'][0]}")
-    print(f"[CONFIG] Head: RealSense RGB + {'Depth' if config['enable_depth'] else 'No Depth'}")
-    if config['enable_depth']:
-        print(f"[CONFIG] Depth: {config['depth_near_mm']}-{config['depth_far_mm']}mm, style={config['depth_style']}")
-    print(f"[CONFIG] Wrist: {wrist_ports if wrist_ports else 'DISABLED'}")
-    
-    server = ImageServer(config, Unit_Test=False)
+        config['wrist_camera_id_numbers'] = [args.wrist]
+
+    print(f"[CONFIG] Resolution: {img_shape[1]}x{img_shape[0]} @ {args.fps}fps")
+    print(f"[CONFIG] Head: OpenCV /dev/video{args.head}")
+    if 'wrist_camera_type' in config:
+        print(f"[CONFIG] Right wrist: OpenCV /dev/video{args.wrist}")
+    else:
+        print("[CONFIG] Wrist: DISABLED")
+
+    server = ImageServer(config, port=args.port, Unit_Test=False)
     server.send_process()
