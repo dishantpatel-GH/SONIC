@@ -3524,18 +3524,7 @@ class G1Deploy {
           
           // set hand poses (use buffered data for consistency)
           inspire_hands_.setAllJointsCommand(true, left_hand_joint_buffer_);
-
-          // Invert right hand commands: solver convention (0=open, max=close)
-          // may be opposite to motor direction on some Inspire hand units.
-          // max_limits: thumb_yaw=1.3, thumb_pitch=0.6, index/mid/ring/pinky=1.7
-          {
-            constexpr std::array<double, 7> rh_max = {1.3, 0.6, 1.7, 1.7, 1.7, 1.7, 0.0};
-            std::array<double, 7> rh_inverted;
-            for (int i = 0; i < 7; ++i) {
-              rh_inverted[i] = rh_max[i] - right_hand_joint_buffer_[i];
-            }
-            inspire_hands_.setAllJointsCommand(false, rh_inverted);
-          }
+          inspire_hands_.setAllJointsCommand(false, right_hand_joint_buffer_);
           
           // Update last hand actions for logging (use buffered data)
           for (int i = 0; i < 7; ++i) {

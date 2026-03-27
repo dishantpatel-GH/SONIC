@@ -95,6 +95,14 @@ except ImportError:
     G1InspireHandTrackingSolver = None
 
 try:
+    from gear_sonic.utils.teleop.solver.hand.g1_inspire_dexpilot_solver import (
+        G1InspireDexPilotSolver,
+    )
+except ImportError:
+    print("Warning: G1InspireDexPilotSolver not available (dex_retargeting may not be installed).")
+    G1InspireDexPilotSolver = None
+
+try:
     from gear_sonic.utils.teleop.vis.vr3pt_pose_visualizer import VR3PtPoseVisualizer
 except ImportError:
     print("Warning: VR3PtPoseVisualizer not available (pyvista may not be installed).")
@@ -756,13 +764,27 @@ def init_hand_ik_solvers():
 
 
 def init_hand_tracking_solvers():
-    """Initialize Inspire hand tracking solvers if available."""
+    """Initialize Inspire hand tracking solvers.
+
+    Tries DexPilot-based solver first (better retargeting quality), falls back
+    to the simpler geometric hand tracking solver if dex_retargeting is unavailable.
+    """
+    if G1InspireDexPilotSolver is not None:
+        try:
+            left_solver = G1InspireDexPilotSolver(side="left")
+            right_solver = G1InspireDexPilotSolver(side="right")
+            print("Inspire DexPilot hand retargeting solvers initialized")
+            return left_solver, right_solver
+        except Exception as e:
+            print(f"Warning: DexPilot solver init failed ({e}), falling back to geometric solver")
+
     if G1InspireHandTrackingSolver is not None:
         left_solver = G1InspireHandTrackingSolver(side="left")
         right_solver = G1InspireHandTrackingSolver(side="right")
-        print("Inspire hand tracking solvers initialized")
+        print("Inspire geometric hand tracking solvers initialized (fallback)")
         return left_solver, right_solver
-    print("Warning: Inspire hand tracking solvers not available")
+
+    print("Warning: No Inspire hand tracking solvers available")
     return None, None
 
 

@@ -1,0 +1,66 @@
+# DexPilot retargeting config for Inspire DFQ hands with PICO OpenXR hand tracking.
+#
+# PICO uses the 26-joint OpenXR hand layout (vs Apple Vision Pro's 25-joint layout).
+# The human indices here map into the 26-joint PICO format:
+#   0=Palm, 1=Wrist,
+#   2-5=Thumb (Metacarpal/Proximal/Distal/Tip),
+#   6-10=Index, 11-15=Middle, 16-20=Ring, 21-25=Pinky
+#
+# Reference vectors (15 total for 5-finger DexPilot):
+#   S1 (10 finger-to-finger): pairs of fingertip position differences
+#   S2 (5 wrist-to-fingertip): wrist→each fingertip
+#
+# Row 0 = origin landmark indices, Row 1 = target landmark indices
+# ref_vector[i] = hand_pos[row1[i]] - hand_pos[row0[i]]
+
+left:
+  type: DexPilot
+  urdf_path: inspire_hand/inspire_hand_left.urdf
+
+  target_joint_names:
+    [
+      'L_thumb_proximal_yaw_joint',
+      'L_thumb_proximal_pitch_joint',
+      'L_index_proximal_joint',
+      'L_middle_proximal_joint',
+      'L_ring_proximal_joint',
+      'L_pinky_proximal_joint'
+    ]
+
+  wrist_link_name: "L_hand_base_link"
+  finger_tip_link_names: [ "L_thumb_tip", "L_index_tip", "L_middle_tip", "L_ring_tip", "L_pinky_tip" ]
+
+  # PICO 26-joint indices (Apple Vision Pro indices + 1 due to extra Palm joint at index 0)
+  # S1 finger-finger pairs (10): index→thumb, middle→thumb, ring→thumb, pinky→thumb,
+  #   middle→index, ring→index, pinky→index, ring→middle, pinky→middle, pinky→ring
+  # S2 wrist→fingertip (5): wrist→thumb, wrist→index, wrist→middle, wrist→ring, wrist→pinky
+  target_link_human_indices_dexpilot:
+    [[10, 15, 20, 25, 15, 20, 25, 20, 25, 25,  1,  1,  1,  1,  1],
+     [ 5,  5,  5,  5, 10, 10, 10, 15, 15, 20,  5, 10, 15, 20, 25]]
+
+  scaling_factor: 1.20
+  low_pass_alpha: 0.2
+
+right:
+  type: DexPilot
+  urdf_path: inspire_hand/inspire_hand_right.urdf
+
+  target_joint_names:
+    [
+      'R_thumb_proximal_yaw_joint',
+      'R_thumb_proximal_pitch_joint',
+      'R_index_proximal_joint',
+      'R_middle_proximal_joint',
+      'R_ring_proximal_joint',
+      'R_pinky_proximal_joint'
+    ]
+
+  wrist_link_name: "R_hand_base_link"
+  finger_tip_link_names: [ "R_thumb_tip", "R_index_tip", "R_middle_tip", "R_ring_tip", "R_pinky_tip" ]
+
+  target_link_human_indices_dexpilot:
+    [[10, 15, 20, 25, 15, 20, 25, 20, 25, 25,  1,  1,  1,  1,  1],
+     [ 5,  5,  5,  5, 10, 10, 10, 15, 15, 20,  5, 10, 15, 20, 25]]
+
+  scaling_factor: 1.20
+  low_pass_alpha: 0.2

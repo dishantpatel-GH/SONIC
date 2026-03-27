@@ -11,6 +11,37 @@
  *  - Convenience helpers: open(), close(), hold(), stop().
  *  - setAllJointsCommand(is_left, q[7]) – uses first 6 elements; 7th ignored for API compatibility.
  *
+ * ## Motor Layout (per hand, per Unitree docs)
+ *
+ *   DDS Index | Joint
+ *   ----------|------------------
+ *   0 / 6     | pinky
+ *   1 / 7     | ring
+ *   2 / 8     | middle
+ *   3 / 9     | index
+ *   4 / 10    | thumb bend (pitch)
+ *   5 / 11    | thumb rotation (yaw)
+ *
+ * ## Pipeline Joint Order (from Python solver)
+ *
+ *   Pipeline Index | Joint
+ *   ---------------|------------------
+ *   0              | thumb_yaw     [-0.1, 1.3] rad
+ *   1              | thumb_pitch   [-0.1, 0.6] rad
+ *   2              | index         [ 0.0, 1.7] rad
+ *   3              | middle        [ 0.0, 1.7] rad
+ *   4              | ring          [ 0.0, 1.7] rad
+ *   5              | pinky         [ 0.0, 1.7] rad
+ *   6              | padding       (always 0)
+ *
+ * ## Hardware Command Format
+ *
+ * The Inspire DFX hardware expects q values in [0.0, 1.0]:
+ *   - 0.0 = fully closed
+ *   - 1.0 = fully open
+ *
+ * Conversion: hw_q = clamp((max_rad - pipeline_rad) / (max_rad - min_rad), 0, 1)
+ *
  * ## Close-Ratio Limiting
  *
  * A runtime-adjustable max_close_ratio_ (range [0.2, 1.0]) limits how far the
@@ -81,7 +112,7 @@ public:
         for (int i = 0; i < INSPIRE_TOTAL_MOTORS; ++i)
         {
             init_cmd.cmds()[i].mode(1);
-            init_cmd.cmds()[i].q(0.0f);
+            init_cmd.cmds()[i].q(1.0f);  // 1.0 = fully open in hardware convention
             init_cmd.cmds()[i].dq(0.0f);
             init_cmd.cmds()[i].kp(0.0f);
             init_cmd.cmds()[i].kd(0.0f);
@@ -104,10 +135,13 @@ public:
 
     void writeOnce()
     {
-        constexpr double MAX_DELTA_Q = 0.25;
+        // Max change per cycle in [0, 1] normalized space.
+        // Smoothing is against last_sent_q_ (our own previous command), NOT against
+        // DDS state feedback, because the state topic returns raw encoder values
+        // (not [0,1] normalized), which would corrupt the smoothing calculation.
+        constexpr double MAX_DELTA_Q = 0.1;
 
         auto cmdPtr = cmd_buffer_.GetDataWithTime().data;
-        auto statePtr = state_buffer_.GetDataWithTime().data;
 
         if (!publisher_ || !cmdPtr || static_cast<int>(cmdPtr->cmds().size()) != INSPIRE_TOTAL_MOTORS)
             return;
@@ -115,34 +149,32 @@ public:
         unitree_go::msg::dds_::MotorCmds_ smoothedCmd;
         smoothedCmd.cmds().resize(INSPIRE_TOTAL_MOTORS);
 
-        for (int hand = 0; hand < 2; ++hand)
+        for (int i = 0; i < INSPIRE_TOTAL_MOTORS; ++i)
         {
-            bool is_left = (hand == 1);
-            const int base = is_left ? 6 : 0;
-            const auto& maxL = is_left ? MAX_LIMITS_LEFT : MAX_LIMITS_RIGHT;
-            const auto& minL = is_left ? MIN_LIMITS_LEFT : MIN_LIMITS_RIGHT;
+            double desired_q = static_cast<double>(cmdPtr->cmds()[i].q());
 
-            for (int i = 0; i < INSPIRE_MOTOR_PER_HAND; ++i)
-            {
-                int idx = base + i;
-                double desired_q = static_cast<double>(cmdPtr->cmds()[idx].q());
-                desired_q = clipToMaxOpen(desired_q, maxL[i], minL[i], max_close_ratio_);
+            // Clamp to [0, 1] range
+            desired_q = std::max(0.0, std::min(1.0, desired_q));
 
-                if (statePtr && static_cast<int>(statePtr->states().size()) == INSPIRE_TOTAL_MOTORS)
-                {
-                    double current_q = static_cast<double>(statePtr->states()[idx].q());
-                    double delta = desired_q - current_q;
-                    double clamped_delta = std::max(-MAX_DELTA_Q, std::min(MAX_DELTA_Q, delta));
-                    desired_q = current_q + clamped_delta;
-                }
+            // Apply max_close_ratio: prevent closing below this threshold
+            // In hw convention: 0=closed, 1=open. Limit minimum to (1 - max_close_ratio)
+            double min_allowed = 1.0 - max_close_ratio_;
+            if (desired_q < min_allowed)
+                desired_q = min_allowed;
 
-                smoothedCmd.cmds()[idx].mode(1);
-                smoothedCmd.cmds()[idx].q(static_cast<float>(desired_q));
-                smoothedCmd.cmds()[idx].dq(0.0f);
-                smoothedCmd.cmds()[idx].kp(0.0f);
-                smoothedCmd.cmds()[idx].kd(0.0f);
-                smoothedCmd.cmds()[idx].tau(0.0f);
-            }
+            // Delta-q smoothing against last sent command
+            double delta = desired_q - last_sent_q_[i];
+            double clamped_delta = std::max(-MAX_DELTA_Q, std::min(MAX_DELTA_Q, delta));
+            desired_q = last_sent_q_[i] + clamped_delta;
+
+            smoothedCmd.cmds()[i].mode(1);
+            smoothedCmd.cmds()[i].q(static_cast<float>(desired_q));
+            smoothedCmd.cmds()[i].dq(0.0f);
+            smoothedCmd.cmds()[i].kp(0.0f);
+            smoothedCmd.cmds()[i].kd(0.0f);
+            smoothedCmd.cmds()[i].tau(0.0f);
+
+            last_sent_q_[i] = desired_q;
         }
 
         publisher_->Write(smoothedCmd);
@@ -156,10 +188,22 @@ public:
             return snap;
 
         const int base = is_left ? 6 : 0;
-        for (int i = 0; i < INSPIRE_MOTOR_PER_HAND; ++i)
+
+        // Read hardware state (in [0,1] hw motor order) and convert to pipeline format
+        // Hardware order: [pinky, ring, middle, index, thumb_pitch, thumb_yaw]
+        // Pipeline order: [thumb_yaw, thumb_pitch, index, middle, ring, pinky]
+        for (int pi = 0; pi < INSPIRE_MOTOR_PER_HAND; ++pi)
         {
-            snap.q[i] = static_cast<double>(statePtr->states()[base + i].q());
-            snap.dq[i] = static_cast<double>(statePtr->states()[base + i].dq());
+            int hw_motor = PIPELINE_TO_HW[pi];
+            double hw_q = static_cast<double>(statePtr->states()[base + hw_motor].q());
+            double hw_dq = static_cast<double>(statePtr->states()[base + hw_motor].dq());
+
+            // Denormalize from [0, 1] hardware convention to radians in pipeline convention
+            // hw_q: 0=closed, 1=open.  pipeline: 0=open, max=closed
+            // rad = max - hw_q * (max - min)
+            double range = PIPE_MAX_LIMITS[pi] - PIPE_MIN_LIMITS[pi];
+            snap.q[pi] = PIPE_MAX_LIMITS[pi] - hw_q * range;
+            snap.dq[pi] = -hw_dq * range;  // negate because hw and pipeline have opposite sign
         }
         snap.q[6] = 0.0;
         snap.dq[6] = 0.0;
@@ -181,7 +225,7 @@ public:
             for (int i = 0; i < INSPIRE_TOTAL_MOTORS; ++i)
             {
                 cmd.cmds()[i].mode(1);
-                cmd.cmds()[i].q(0.0f);
+                cmd.cmds()[i].q(1.0f);  // default to open
                 cmd.cmds()[i].dq(0.0f);
                 cmd.cmds()[i].kp(0.0f);
                 cmd.cmds()[i].kd(0.0f);
@@ -190,31 +234,26 @@ public:
         }
 
         const int base = is_left ? 6 : 0;
-        for (int i = 0; i < INSPIRE_MOTOR_PER_HAND; ++i)
-        {
-            auto& m = cmd.cmds()[base + i];
-            m.mode(1);
-            m.q(static_cast<float>(q[i]));
-            m.dq(dq ? static_cast<float>((*dq)[i]) : 0.0f);
-            m.kp(kp ? static_cast<float>((*kp)[i]) : 0.0f);
-            m.kd(kd ? static_cast<float>((*kd)[i]) : 0.0f);
-            m.tau(tau ? static_cast<float>((*tau)[i]) : 0.0f);
-        }
-        cmd_buffer_.SetData(std::move(cmd));
-    }
 
-    void stop(bool is_left)
-    {
-        auto currentPtr = cmd_buffer_.GetDataWithTime().data;
-        unitree_go::msg::dds_::MotorCmds_ cmd = currentPtr ? *currentPtr : unitree_go::msg::dds_::MotorCmds_();
-        if (cmd.cmds().size() != static_cast<size_t>(INSPIRE_TOTAL_MOTORS))
-            cmd.cmds().resize(INSPIRE_TOTAL_MOTORS);
-        const int base = is_left ? 6 : 0;
-        for (int i = 0; i < INSPIRE_MOTOR_PER_HAND; ++i)
+        // Convert from pipeline format (radians) to hardware format ([0,1] normalized)
+        // and reorder from pipeline order to hardware motor order.
+        //
+        // Pipeline: [thumb_yaw, thumb_pitch, index, middle, ring, pinky]
+        // Hardware: [pinky, ring, middle, index, thumb_pitch, thumb_yaw]
+        //
+        // Normalization: hw_q = clamp((max_rad - val_rad) / (max_rad - min_rad), 0, 1)
+        //   This maps: val=0 (open) → hw_q=1 (open), val=max (closed) → hw_q=0 (closed)
+        for (int pi = 0; pi < INSPIRE_MOTOR_PER_HAND; ++pi)
         {
-            auto& m = cmd.cmds()[base + i];
+            int hw_motor = PIPELINE_TO_HW[pi];
+            double range = PIPE_MAX_LIMITS[pi] - PIPE_MIN_LIMITS[pi];
+            double hw_q = (range > 1e-6)
+                ? std::max(0.0, std::min(1.0, (PIPE_MAX_LIMITS[pi] - q[pi]) / range))
+                : 0.5;
+
+            auto& m = cmd.cmds()[base + hw_motor];
             m.mode(1);
-            m.q(0.0f);
+            m.q(static_cast<float>(hw_q));
             m.dq(0.0f);
             m.kp(0.0f);
             m.kd(0.0f);
@@ -223,18 +262,27 @@ public:
         cmd_buffer_.SetData(std::move(cmd));
     }
 
+    void stop(bool is_left)
+    {
+        // Open hands (q=0 in pipeline = open) with no holding torque
+        std::array<double, 7> q_sim = {0.0};
+        setAllJointsCommand(is_left, q_sim);
+    }
+
     void hold(bool is_left, double kp = 1.5, double kd = 0.1)
     {
         auto statePtr = state_buffer_.GetDataWithTime().data;
         if (!statePtr || static_cast<int>(statePtr->states().size()) != INSPIRE_TOTAL_MOTORS)
             return;
         const int base = is_left ? 6 : 0;
+        // hold() writes raw hardware q back directly — no conversion needed
+        // since we read hardware state and write it back to hardware
         unitree_go::msg::dds_::MotorCmds_ cmd;
         cmd.cmds().resize(INSPIRE_TOTAL_MOTORS);
         for (int i = 0; i < INSPIRE_TOTAL_MOTORS; ++i)
         {
             cmd.cmds()[i].mode(1);
-            cmd.cmds()[i].q(0.0f);
+            cmd.cmds()[i].q(1.0f);
             cmd.cmds()[i].dq(0.0f);
             cmd.cmds()[i].kp(0.0f);
             cmd.cmds()[i].kd(0.0f);
@@ -252,45 +300,31 @@ public:
 
     void close(bool is_left, double kp = 1.5, double kd = 0.1)
     {
-        const auto& maxL = is_left ? MAX_LIMITS_LEFT : MAX_LIMITS_RIGHT;
-        const auto& minL = is_left ? MIN_LIMITS_LEFT : MIN_LIMITS_RIGHT;
-        auto currentPtr = cmd_buffer_.GetDataWithTime().data;
-        unitree_go::msg::dds_::MotorCmds_ cmd = currentPtr ? *currentPtr : unitree_go::msg::dds_::MotorCmds_();
-        if (cmd.cmds().size() != static_cast<size_t>(INSPIRE_TOTAL_MOTORS))
-            cmd.cmds().resize(INSPIRE_TOTAL_MOTORS);
-        const int base = is_left ? 6 : 0;
+        // Close = mid-range in pipeline convention
+        std::array<double, 7> q_sim = {0.0};
+        std::array<double, 7> kp_arr = {0.0};
+        std::array<double, 7> kd_arr = {0.0};
         for (int i = 0; i < INSPIRE_MOTOR_PER_HAND; ++i)
         {
-            double mid = (maxL[i] + minL[i]) / 2.0;
-            auto& m = cmd.cmds()[base + i];
-            m.mode(1);
-            m.q(static_cast<float>(mid));
-            m.dq(0.0f);
-            m.kp(static_cast<float>(kp));
-            m.kd(static_cast<float>(kd));
-            m.tau(0.0f);
+            q_sim[i] = (PIPE_MAX_LIMITS[i] + PIPE_MIN_LIMITS[i]) / 2.0;
+            kp_arr[i] = kp;
+            kd_arr[i] = kd;
         }
-        cmd_buffer_.SetData(std::move(cmd));
+        setAllJointsCommand(is_left, q_sim, std::nullopt, kp_arr, kd_arr);
     }
 
     void open(bool is_left, double kp = 1.5, double kd = 0.1)
     {
-        auto currentPtr = cmd_buffer_.GetDataWithTime().data;
-        unitree_go::msg::dds_::MotorCmds_ cmd = currentPtr ? *currentPtr : unitree_go::msg::dds_::MotorCmds_();
-        if (cmd.cmds().size() != static_cast<size_t>(INSPIRE_TOTAL_MOTORS))
-            cmd.cmds().resize(INSPIRE_TOTAL_MOTORS);
-        const int base = is_left ? 6 : 0;
+        // Open = 0 in pipeline convention
+        std::array<double, 7> q_sim = {0.0};
+        std::array<double, 7> kp_arr = {0.0};
+        std::array<double, 7> kd_arr = {0.0};
         for (int i = 0; i < INSPIRE_MOTOR_PER_HAND; ++i)
         {
-            auto& m = cmd.cmds()[base + i];
-            m.mode(1);
-            m.q(0.0f);
-            m.dq(0.0f);
-            m.kp(static_cast<float>(kp));
-            m.kd(static_cast<float>(kd));
-            m.tau(0.0f);
+            kp_arr[i] = kp;
+            kd_arr[i] = kd;
         }
-        cmd_buffer_.SetData(std::move(cmd));
+        setAllJointsCommand(is_left, q_sim, std::nullopt, kp_arr, kd_arr);
     }
 
 private:
@@ -304,6 +338,9 @@ private:
     DataBuffer<MotorCmds> cmd_buffer_;
     DataBuffer<MotorStates> state_buffer_;
     double max_close_ratio_ = 1.0;
+    std::array<double, INSPIRE_TOTAL_MOTORS> last_sent_q_ = {
+        1.0, 1.0, 1.0, 1.0, 1.0, 1.0,   // right hand: all open
+        1.0, 1.0, 1.0, 1.0, 1.0, 1.0};  // left hand: all open
 
     void onState(const void* message)
     {
@@ -311,22 +348,17 @@ private:
         state_buffer_.SetData(*incoming);
     }
 
-    static double clipToMaxOpen(double desired_q, double max_limit, double min_limit, double max_close_ratio)
-    {
-        double q_max_open_pos = max_close_ratio * max_limit;
-        double q_max_open_neg = max_close_ratio * min_limit;
-        if (desired_q > 0.0 && max_limit > 0.0 && desired_q > q_max_open_pos)
-            return q_max_open_pos;
-        if (desired_q < 0.0 && min_limit < 0.0 && desired_q < q_max_open_neg)
-            return q_max_open_neg;
-        return desired_q;
-    }
+    // ---- Joint limit and reorder tables ----
 
-    // Inspire hand DFQ joint limits (per hand): thumb_yaw, thumb_pitch, index, middle, ring, pinky
-    static constexpr std::array<double, INSPIRE_MOTOR_PER_HAND> MAX_LIMITS_LEFT  = { 1.3,  0.6,  1.7,  1.7,  1.7,  1.7 };
-    static constexpr std::array<double, INSPIRE_MOTOR_PER_HAND> MIN_LIMITS_LEFT  = {-0.1, -0.1,  0.0,  0.0,  0.0,  0.0 };
-    static constexpr std::array<double, INSPIRE_MOTOR_PER_HAND> MAX_LIMITS_RIGHT = { 1.3,  0.6,  1.7,  1.7,  1.7,  1.7 };
-    static constexpr std::array<double, INSPIRE_MOTOR_PER_HAND> MIN_LIMITS_RIGHT = {-0.1, -0.1,  0.0,  0.0,  0.0,  0.0 };
+    // Pipeline joint limits (in pipeline order: thumb_yaw, thumb_pitch, index, middle, ring, pinky)
+    static constexpr std::array<double, INSPIRE_MOTOR_PER_HAND> PIPE_MAX_LIMITS = { 1.3,  0.6,  1.7,  1.7,  1.7,  1.7 };
+    static constexpr std::array<double, INSPIRE_MOTOR_PER_HAND> PIPE_MIN_LIMITS = {-0.1, -0.1,  0.0,  0.0,  0.0,  0.0 };
+
+    // Mapping from pipeline index → hardware DDS motor index (within a single hand)
+    //
+    // Pipeline: [0:thumb_yaw, 1:thumb_pitch, 2:index, 3:middle, 4:ring, 5:pinky]
+    // Hardware: [0:pinky,     1:ring,        2:middle, 3:index,  4:thumb_pitch, 5:thumb_yaw]
+    static constexpr std::array<int, INSPIRE_MOTOR_PER_HAND> PIPELINE_TO_HW = {5, 4, 3, 2, 1, 0};
 };
 
 #endif // INSPIRE_HANDS_HPP
