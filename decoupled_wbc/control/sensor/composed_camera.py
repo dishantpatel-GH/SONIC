@@ -24,11 +24,16 @@ except ImportError:
     try:
         from decoupled_wbc.control.sensor.depth_visualization_3ddp import depth_to_visualization
     except ImportError:
-        from depth_visualization_3ddp import depth_to_visualization
+        try:
+            from depth_visualization_3ddp import depth_to_visualization
+        except ImportError:
+            depth_to_visualization = None
 
 
 def _depth_to_display(depth: np.ndarray, near_mm: int, far_mm: int, style: str = "3ddp") -> np.ndarray:
     """Use 3D-Diffusion-Policy style (3ddp) or fallback heatmap."""
+    if depth_to_visualization is None:
+        raise RuntimeError("depth_visualization_3ddp not available (only needed for ImageServer, not client)")
     return depth_to_visualization(depth, style=style, near_mm=near_mm, far_mm=far_mm)
 
 
@@ -325,11 +330,8 @@ class ImageServer:
         try:
             while True:
                 head_frames = []
-                raw_depth_image = None
-                camera_frames = {}
-                camera_timestamps = {}
-                frame_time = time.time()
-
+                raw_depth_image = None  # Store raw 16-bit depth for recording
+                
                 for cam in self.head_cameras:
                     if self.head_camera_type == 'opencv':
                         color_image = cam.get_frame()
@@ -337,19 +339,16 @@ class ImageServer:
                             logger_mp.error("[Image Server] Head camera frame read is error.")
                             break
                         head_frames.append(color_image)
-                        camera_frames['ego_view'] = color_image
-                        camera_timestamps['ego_view'] = frame_time
                     elif self.head_camera_type == 'realsense':
                         result = cam.get_frame()
                         if result is None or result[0] is None:
                             logger_mp.error("[Image Server] Head camera frame read is error.")
                             break
                         color_image, depth_image = result
+                        # Order: RGB first, then Depth (colorized for display)
                         head_frames.append(color_image)
-                        camera_frames['ego_view'] = color_image
-                        camera_timestamps['ego_view'] = frame_time
                         if depth_image is not None:
-                            raw_depth_image = depth_image.copy()
+                            raw_depth_image = depth_image.copy()  # Keep raw 16-bit depth
                             depth_colormap = _depth_to_display(
                                 depth_image,
                                 near_mm=self.depth_near_mm,
@@ -360,11 +359,11 @@ class ImageServer:
                 if not head_frames:
                     break
                 head_color = cv2.hconcat(head_frames)
-
+                
                 if self.wrist_cameras:
                     wrist_frames = []
                     wrist_ok = True
-                    for i, cam in enumerate(self.wrist_cameras):
+                    for cam in self.wrist_cameras:
                         if self.wrist_camera_type == 'opencv':
                             color_image = cam.get_frame()
                             if color_image is None:
@@ -372,20 +371,19 @@ class ImageServer:
                                 wrist_ok = False
                                 break
                         elif self.wrist_camera_type == 'realsense':
-                            color_image, _depth = cam.get_frame()
+                            color_image, depth_iamge = cam.get_frame()
                             if color_image is None:
                                 logger_mp.warning("[Image Server] Wrist camera frame read failed, skipping wrist.")
                                 wrist_ok = False
                                 break
                         wrist_frames.append(color_image)
-                        wrist_name = 'right_wrist' if i == 0 else f'wrist_{i}'
-                        camera_frames[wrist_name] = color_image
-                        camera_timestamps[wrist_name] = frame_time
-
+                    
                     if wrist_ok and wrist_frames:
                         wrist_color = cv2.hconcat(wrist_frames)
+                        # Concatenate head and wrist frames
                         full_color = cv2.hconcat([head_color, wrist_color])
                     else:
+                        # No wrist, just use head
                         full_color = head_color
                 else:
                     full_color = head_color
@@ -397,18 +395,11 @@ class ImageServer:
 
                 jpg_bytes = buffer.tobytes()
 
-                # JPEG-encode individual camera frames for data collection
-                camera_frames_jpg = {}
-                for name, frame in camera_frames.items():
-                    ok, buf = cv2.imencode('.jpg', frame)
-                    if ok:
-                        camera_frames_jpg[name] = buf.tobytes()
-
+                # Pack message with raw depth data for recording
+                # Format: pickle({'image': jpg_bytes, 'depth_raw': raw_depth_image})
                 message_data = {
                     'image': jpg_bytes,
-                    'depth_raw': raw_depth_image,
-                    'camera_frames': camera_frames_jpg,
-                    'camera_timestamps': camera_timestamps,
+                    'depth_raw': raw_depth_image,  # 16-bit numpy array or None
                 }
                 message = pickle.dumps(message_data)
 
@@ -428,24 +419,27 @@ class ImageServer:
 class ComposedCameraClientSensor:
     """ZMQ client that receives camera frames from ImageServer.
 
+    Handles two server formats:
+      - New format: pickle({'camera_frames': {name: jpg_bytes}, 'camera_timestamps': {...}})
+      - Old format: pickle({'image': jpg_bytes, 'depth_raw': ...})
+        The 'image' key contains a single concatenated JPEG [head | wrist].
+        With --no-depth --wrist 1: width = head_w + wrist_w (e.g. 640+640=1280).
+
     Returns data in the format expected by the data exporter:
         {"images": {"ego_view": np.ndarray, ...}, "timestamps": {"ego_view": float, ...}}
     """
 
-    def __init__(self, server_ip="localhost", port=5555):
+    def __init__(self, server_ip="localhost", port=5555, head_width=640):
         self._context = zmq.Context()
         self._socket = self._context.socket(zmq.SUB)
         self._socket.connect(f"tcp://{server_ip}:{port}")
         self._socket.setsockopt_string(zmq.SUBSCRIBE, "")
         self._latest_message = None
+        self._head_width = head_width
         logger_mp.info(f"[CameraClient] Connected to tcp://{server_ip}:{port}")
 
     def read(self):
-        """Non-blocking receive of latest camera frame.
-
-        Drains the ZMQ queue and returns only the most recent message
-        to avoid stale frames building up.
-        """
+        """Non-blocking receive of latest camera frame."""
         latest_raw = None
         while True:
             try:
@@ -464,22 +458,48 @@ class ComposedCameraClientSensor:
         if not isinstance(data, dict):
             return self._latest_message
 
-        camera_frames_jpg = data.get('camera_frames', {})
-        camera_timestamps = data.get('camera_timestamps', {})
+        frame_time = time.time()
 
-        if not camera_frames_jpg:
+        # --- New format: server sends per-camera JPEGs ---
+        camera_frames_jpg = data.get('camera_frames', {})
+        if camera_frames_jpg:
+            camera_timestamps = data.get('camera_timestamps', {})
+            images = {}
+            for name, jpg_bytes in camera_frames_jpg.items():
+                np_buf = np.frombuffer(jpg_bytes, dtype=np.uint8)
+                img = cv2.imdecode(np_buf, cv2.IMREAD_COLOR)
+                if img is not None:
+                    images[name] = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            if images:
+                self._latest_message = {"images": images, "timestamps": camera_timestamps}
             return self._latest_message
 
+        # --- Old format: single concatenated JPEG [head | wrist] ---
+        jpg_bytes = data.get('image')
+        if jpg_bytes is None:
+            return self._latest_message
+
+        np_buf = np.frombuffer(jpg_bytes, dtype=np.uint8)
+        full_img = cv2.imdecode(np_buf, cv2.IMREAD_COLOR)
+        if full_img is None:
+            return self._latest_message
+
+        h, w = full_img.shape[:2]
         images = {}
-        for name, jpg_bytes in camera_frames_jpg.items():
-            np_buf = np.frombuffer(jpg_bytes, dtype=np.uint8)
-            img = cv2.imdecode(np_buf, cv2.IMREAD_COLOR)
-            if img is not None:
-                images[name] = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        timestamps = {}
 
-        if images:
-            self._latest_message = {"images": images, "timestamps": camera_timestamps}
+        if w > self._head_width:
+            # Concatenated: [ego_view | right_wrist]
+            images["ego_view"] = cv2.cvtColor(full_img[:, :self._head_width], cv2.COLOR_BGR2RGB)
+            images["right_wrist"] = cv2.cvtColor(full_img[:, self._head_width:], cv2.COLOR_BGR2RGB)
+        else:
+            # Head only (no wrist or width matches head exactly)
+            images["ego_view"] = cv2.cvtColor(full_img, cv2.COLOR_BGR2RGB)
 
+        for name in images:
+            timestamps[name] = frame_time
+
+        self._latest_message = {"images": images, "timestamps": timestamps}
         return self._latest_message
 
     def close(self):
@@ -492,42 +512,61 @@ class ComposedCameraClientSensor:
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="Camera streaming server (Arduino/OpenCV cameras)")
-    parser.add_argument('--head', type=int, default=0, help='Head camera /dev/video device ID (default: 0)')
-    parser.add_argument('--wrist', type=int, default=None, help='Right wrist camera /dev/video device ID (default: None = disabled)')
-    parser.add_argument('--no-wrist', action='store_true', help='Disable wrist camera')
-    parser.add_argument('--resolution', type=str, default='640x480', help='Width x height (default: 640x480)')
-    parser.add_argument('--fps', type=int, default=30, help='Frames per second (default: 30)')
-    parser.add_argument('--port', type=int, default=5555, help='ZMQ publish port (default: 5555)')
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--wrist', type=int, nargs='+', default=[], help='Wrist camera ports (empty or -1 to disable)')
+    parser.add_argument('--no-depth', action='store_true', help='Disable depth')
+    parser.add_argument('--no-wrist', action='store_true', help='Disable wrist cameras')
+    parser.add_argument('--depth-near', type=int, default=250, help='Depth near plane (mm)')
+    parser.add_argument('--depth-far', type=int, default=4000, help='Depth far plane (mm)')
+    parser.add_argument('--depth-style', type=str, default='turbo', choices=['3ddp', 'turbo', 'jet'],
+                        help='3ddp=3D-Diffusion-Policy style (u,v,depth as RGB), turbo/jet=colormap')
+    parser.add_argument('--resolution', type=str, default='640x480', help='Width x height')
     args = parser.parse_args()
-
+    
+    # Auto-detect RealSense
+    ctx = rs.context()
+    devices = ctx.query_devices()
+    if len(devices) == 0:
+        print("ERROR: No RealSense camera found!")
+        exit(1)
+    serial = devices[0].get_info(rs.camera_info.serial_number)
+    print(f"[AUTO] RealSense: {serial}")
+    
+    # Handle wrist camera config
+    wrist_ports = args.wrist
+    if args.no_wrist or wrist_ports == [-1]:
+        wrist_ports = []
+    
     # Parse resolution
     try:
         w, h = map(int, args.resolution.lower().split('x'))
         img_shape = [h, w]  # [height, width]
     except Exception:
         img_shape = [480, 640]
-        print(f'[CONFIG] Invalid --resolution "{args.resolution}", using 640x480')
-
+        logger_mp.warning(f'[CONFIG] Invalid --resolution "{args.resolution}", using 640x480')
+    
     config = {
-        'fps': args.fps,
-        'head_camera_type': 'opencv',
+        'fps': 30,
+        'head_camera_type': 'realsense',
         'head_camera_image_shape': img_shape,
-        'head_camera_id_numbers': [args.head],
+        'head_camera_id_numbers': [serial],
+        'enable_depth': not args.no_depth,
+        'depth_near_mm': args.depth_near,
+        'depth_far_mm': args.depth_far,
+        'depth_style': args.depth_style,
     }
-
-    # Add right wrist camera if specified
-    if args.wrist is not None and not args.no_wrist:
+    
+    # Only add wrist config if wrist cameras specified
+    if wrist_ports:
         config['wrist_camera_type'] = 'opencv'
         config['wrist_camera_image_shape'] = img_shape
-        config['wrist_camera_id_numbers'] = [args.wrist]
-
-    print(f"[CONFIG] Resolution: {img_shape[1]}x{img_shape[0]} @ {args.fps}fps")
-    print(f"[CONFIG] Head: OpenCV /dev/video{args.head}")
-    if 'wrist_camera_type' in config:
-        print(f"[CONFIG] Right wrist: OpenCV /dev/video{args.wrist}")
-    else:
-        print("[CONFIG] Wrist: DISABLED")
-
-    server = ImageServer(config, port=args.port, Unit_Test=False)
+        config['wrist_camera_id_numbers'] = wrist_ports
+    
+    print(f"[CONFIG] Resolution: {config['head_camera_image_shape'][1]}x{config['head_camera_image_shape'][0]}")
+    print(f"[CONFIG] Head: RealSense RGB + {'Depth' if config['enable_depth'] else 'No Depth'}")
+    if config['enable_depth']:
+        print(f"[CONFIG] Depth: {config['depth_near_mm']}-{config['depth_far_mm']}mm, style={config['depth_style']}")
+    print(f"[CONFIG] Wrist: {wrist_ports if wrist_ports else 'DISABLED'}")
+    
+    server = ImageServer(config, Unit_Test=False)
     server.send_process()

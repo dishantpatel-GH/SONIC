@@ -122,10 +122,25 @@ class InspireFTPReader:
 
         self._inspire_dds = inspire_dds
 
-        try:
-            ChannelFactoryInitialize(0, "")
-        except Exception:
-            pass
+        # Initialise DDS. Try with explicit interface names to handle Docker
+        # environments where autodetermine fails on bridge interfaces.
+        import os
+        dds_ok = False
+        # If CYCLONEDDS_URI is set, try no-interface first (it'll use the env config)
+        interfaces_to_try = [None, "eno1", "lo", "eth0"]
+        for iface in interfaces_to_try:
+            try:
+                if iface is None:
+                    ChannelFactoryInitialize(0)
+                else:
+                    ChannelFactoryInitialize(0, iface)
+                dds_ok = True
+                print(f"[InspireFTPReader] DDS initialised (interface={iface!r})")
+                break
+            except Exception:
+                continue
+        if not dds_ok:
+            raise RuntimeError("[InspireFTPReader] DDS init failed on all interfaces")
 
         # State subscribers
         self._sub_state_left = ChannelSubscriber(kTopicInspireStateLeft, inspire_dds.inspire_hand_state)

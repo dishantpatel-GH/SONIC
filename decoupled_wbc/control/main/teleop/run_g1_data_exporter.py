@@ -252,23 +252,30 @@ class Gr00tDataCollector:
                 "teleop.base_height_command": np.array([0.74], dtype=np.float64),
             }
 
-            # Add FTP tactile data if available
-            if self.ftp_reader is not None:
-                left_tactile, right_tactile = self.ftp_reader.get_tactile()
+            # Add FTP tactile data (zeros if reader unavailable but features expect it)
+            if "observation.tactile.left_hand" in self.data_exporter.features:
+                if self.ftp_reader is not None:
+                    left_tactile, right_tactile = self.ftp_reader.get_tactile()
+                else:
+                    tdim = self.data_exporter.features["observation.tactile.left_hand"]["shape"][0]
+                    left_tactile = np.zeros(tdim, dtype=np.float32)
+                    right_tactile = np.zeros(tdim, dtype=np.float32)
                 frame_data["observation.tactile.left_hand"] = left_tactile
                 frame_data["observation.tactile.right_hand"] = right_tactile
 
-            # Add images based on dataset features (skip missing optional cameras)
+            # Add images based on dataset features (resize to expected shape if needed)
             images = self.latest_image_msg["images"]
             for feature_name, feature_info in self.data_exporter.features.items():
                 if feature_info.get("dtype") in ["image", "video"]:
                     image_key = feature_name.split(".")[-1]
+                    expected_h, expected_w = feature_info["shape"][0], feature_info["shape"][1]
                     if image_key in images:
-                        frame_data[feature_name] = images[image_key]
+                        img = images[image_key]
+                        if img.shape[0] != expected_h or img.shape[1] != expected_w:
+                            img = cv2.resize(img, (expected_w, expected_h))
+                        frame_data[feature_name] = img
                     else:
-                        # Fill missing camera with black frame
-                        h, w = feature_info["shape"][0], feature_info["shape"][1]
-                        frame_data[feature_name] = np.zeros((h, w, 3), dtype=np.uint8)
+                        frame_data[feature_name] = np.zeros((expected_h, expected_w, 3), dtype=np.uint8)
 
             self.data_exporter.add_frame(frame_data)
 

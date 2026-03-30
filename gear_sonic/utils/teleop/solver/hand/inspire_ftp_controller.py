@@ -113,14 +113,22 @@ class InspireFTPController:
         self._inspire_dds = inspire_dds
         self._inspire_hand_defaut = inspire_hand_defaut
 
-        # Initialise DDS domain (no interface arg = auto-detect, same as xr_teleoperate).
-        # In SONIC the C++ deploy runs DDS in a separate process, so this Python
-        # process needs its own DDS domain for the Inspire FTP topics.
-        try:
-            ChannelFactoryInitialize(0)
-            print("[InspireFTP] DDS domain initialised")
-        except Exception as e:
-            print(f"[InspireFTP] DDS init note: {e} (may already be initialised)")
+        # Initialise DDS domain. Try multiple interfaces to handle Docker
+        # environments where autodetermine fails on bridge interfaces.
+        dds_ok = False
+        for iface in [None, "eno1", "lo", "eth0"]:
+            try:
+                if iface is None:
+                    ChannelFactoryInitialize(0)
+                else:
+                    ChannelFactoryInitialize(0, iface)
+                dds_ok = True
+                print(f"[InspireFTP] DDS initialised (interface={iface!r})")
+                break
+            except Exception:
+                continue
+        if not dds_ok:
+            raise RuntimeError("[InspireFTP] DDS init failed on all interfaces")
 
         # Publishers
         self._pub_left = ChannelPublisher(kTopicInspireCtrlLeft, inspire_dds.inspire_hand_ctrl)
