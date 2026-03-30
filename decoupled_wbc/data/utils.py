@@ -2,7 +2,9 @@ from decoupled_wbc.control.robot_model.robot_model import RobotModel
 from decoupled_wbc.data.constants import RS_VIEW_CAMERA_HEIGHT, RS_VIEW_CAMERA_WIDTH
 
 
-def get_modality_config(robot_model: RobotModel, add_stereo_camera: bool = False) -> dict:
+def get_modality_config(
+    robot_model: RobotModel, add_stereo_camera: bool = False, enable_ftp_hands: bool = False
+) -> dict:
     """
     Get the modality config for the robot model.
     """
@@ -81,10 +83,26 @@ def get_modality_config(robot_model: RobotModel, add_stereo_camera: bool = False
             }
         )
 
+    if enable_ftp_hands:
+        from decoupled_wbc.control.envs.g1.utils.inspire_ftp_reader import TACTILE_DIM
+
+        modality_config["state"]["left_hand_tactile"] = {
+            "start": 0,
+            "end": TACTILE_DIM,
+            "original_key": "observation.tactile.left_hand",
+        }
+        modality_config["state"]["right_hand_tactile"] = {
+            "start": 0,
+            "end": TACTILE_DIM,
+            "original_key": "observation.tactile.right_hand",
+        }
+
     return modality_config
 
 
-def get_dataset_features(robot_model: RobotModel, add_stereo_camera: bool = False) -> dict:
+def get_dataset_features(
+    robot_model: RobotModel, add_stereo_camera: bool = False, enable_ftp_hands: bool = False
+) -> dict:
     """
     Get the dataset features for the robot model.
     """
@@ -145,6 +163,20 @@ def get_dataset_features(robot_model: RobotModel, add_stereo_camera: bool = Fals
             "names": "base_height_command",
         },
     }
+    if enable_ftp_hands:
+        from decoupled_wbc.control.envs.g1.utils.inspire_ftp_reader import TACTILE_DIM, TOUCH_FIELD_NAMES
+
+        dataset_features["observation.tactile.left_hand"] = {
+            "dtype": "float32",
+            "shape": (TACTILE_DIM,),
+            "names": TOUCH_FIELD_NAMES,
+        }
+        dataset_features["observation.tactile.right_hand"] = {
+            "dtype": "float32",
+            "shape": (TACTILE_DIM,),
+            "names": TOUCH_FIELD_NAMES,
+        }
+
     if add_stereo_camera:
         dataset_features.update(
             {

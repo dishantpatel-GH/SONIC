@@ -269,6 +269,10 @@ class DataExporterConfig(BaseConfig, ComposedCameraClientConfig):
     img_stream_viewer: bool = False
     text_to_speech: bool = True
     add_stereo_camera: bool = True
+    enable_ftp_hands: bool = False
+    """Enable Inspire FTP hand data collection (finger joints + tactile).
+    Reads hand state from FTP DDS topics instead of C++ deploy.
+    Requires Headless_driver_double.py running on the robot."""
 
 @dataclass
 class SyncSimDataCollectionConfig(ControlLoopConfig, TeleopConfig):

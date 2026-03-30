@@ -103,8 +103,10 @@ class Gr00tDataCollector:
         text_to_speech=None,
         frequency=20,
         state_act_msg_frequency=50,
+        ftp_reader=None,
     ):
 
+        self.ftp_reader = ftp_reader
         self.text_to_speech = text_to_speech
         self.frequency = frequency
         self.data_exporter = data_exporter
@@ -216,13 +218,25 @@ class Gr00tDataCollector:
                 ], dtype=np.float64)
 
             body_q = np.array(proprio.get("body_q", []), dtype=np.float64)
-            left_hand_q = expand_hand_6_to_12(proprio.get("left_hand_q", []))
-            right_hand_q = expand_hand_6_to_12(proprio.get("right_hand_q", []))
+
+            # Use FTP hand state/action when available, otherwise fall back to C++ deploy
+            if self.ftp_reader is not None:
+                ftp_lh_state, ftp_rh_state = self.ftp_reader.get_hand_state()
+                left_hand_q = expand_hand_6_to_12(ftp_lh_state[:6])
+                right_hand_q = expand_hand_6_to_12(ftp_rh_state[:6])
+            else:
+                left_hand_q = expand_hand_6_to_12(proprio.get("left_hand_q", []))
+                right_hand_q = expand_hand_6_to_12(proprio.get("right_hand_q", []))
             full_q = np.concatenate([body_q, left_hand_q, right_hand_q])
 
             last_action = np.array(proprio.get("last_action", []), dtype=np.float64)
-            last_lh_action = expand_hand_6_to_12(proprio.get("last_left_hand_action", []))
-            last_rh_action = expand_hand_6_to_12(proprio.get("last_right_hand_action", []))
+            if self.ftp_reader is not None:
+                ftp_lh_action, ftp_rh_action = self.ftp_reader.get_hand_action()
+                last_lh_action = expand_hand_6_to_12(ftp_lh_action[:6])
+                last_rh_action = expand_hand_6_to_12(ftp_rh_action[:6])
+            else:
+                last_lh_action = expand_hand_6_to_12(proprio.get("last_left_hand_action", []))
+                last_rh_action = expand_hand_6_to_12(proprio.get("last_right_hand_action", []))
             full_action = np.concatenate([last_action, last_lh_action, last_rh_action])
 
             # eef_state placeholder (C++ deploy doesn't provide wrist poses directly)
@@ -237,6 +251,12 @@ class Gr00tDataCollector:
                 "teleop.navigate_command": np.zeros(3, dtype=np.float64),
                 "teleop.base_height_command": np.array([0.74], dtype=np.float64),
             }
+
+            # Add FTP tactile data if available
+            if self.ftp_reader is not None:
+                left_tactile, right_tactile = self.ftp_reader.get_tactile()
+                frame_data["observation.tactile.left_hand"] = left_tactile
+                frame_data["observation.tactile.right_hand"] = right_tactile
 
             # Add images based on dataset features (skip missing optional cameras)
             images = self.latest_image_msg["images"]
@@ -337,8 +357,12 @@ def main(config: DataExporterConfig):
         waist_location=waist_location, high_elbow_pose=config.high_elbow_pose
     )
 
-    dataset_features = get_dataset_features(g1_rm, config.add_stereo_camera)
-    modality_config = get_modality_config(g1_rm, config.add_stereo_camera)
+    dataset_features = get_dataset_features(
+        g1_rm, config.add_stereo_camera, enable_ftp_hands=config.enable_ftp_hands
+    )
+    modality_config = get_modality_config(
+        g1_rm, config.add_stereo_camera, enable_ftp_hands=config.enable_ftp_hands
+    )
 
     text_to_speech = TextToSpeech() if config.text_to_speech else None
 
@@ -374,6 +398,16 @@ def main(config: DataExporterConfig):
         script_config=robot_config,
     )
 
+    # Initialise FTP hand reader if requested
+    ftp_reader = None
+    if config.enable_ftp_hands:
+        try:
+            from decoupled_wbc.control.envs.g1.utils.inspire_ftp_reader import InspireFTPReader
+
+            ftp_reader = InspireFTPReader()
+        except Exception as e:
+            print(f"[WARNING] FTP hand reader init failed: {e}")
+
     data_collector = Gr00tDataCollector(
         node=node,
         frequency=config.data_collection_frequency,
@@ -382,6 +416,7 @@ def main(config: DataExporterConfig):
         camera_host=config.camera_host,
         camera_port=config.camera_port,
         text_to_speech=text_to_speech,
+        ftp_reader=ftp_reader,
     )
     data_collector.run()
 

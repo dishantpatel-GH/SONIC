@@ -103,6 +103,14 @@ except ImportError:
     G1InspireDexPilotSolver = None
 
 try:
+    from gear_sonic.utils.teleop.solver.hand.inspire_ftp_controller import (
+        InspireFTPController,
+    )
+except ImportError:
+    print("Warning: InspireFTPController not available (inspire_sdkpy may not be installed).")
+    InspireFTPController = None
+
+try:
     from gear_sonic.utils.teleop.vis.vr3pt_pose_visualizer import VR3PtPoseVisualizer
 except ImportError:
     print("Warning: VR3PtPoseVisualizer not available (pyvista may not be installed).")
@@ -1405,6 +1413,7 @@ class PoseStreamer:
         record_dir: str,
         record_format: str,
         log_prefix: str = "PoseLoop",
+        ftp_ctrl=None,
     ):
         self.socket = socket
         self.reader = reader
@@ -1412,6 +1421,7 @@ class PoseStreamer:
         self.target_fps = target_fps
         self.record_dir = record_dir
         self.log_prefix = log_prefix
+        self.ftp_ctrl = ftp_ctrl
 
         # Injected dependencies
         self.reader = reader
@@ -1545,6 +1555,10 @@ class PoseStreamer:
                 right_trigger,
                 right_grip,
             )
+        # Send hand joints to FTP hands if enabled
+        if self.ftp_ctrl is not None:
+            self.ftp_ctrl.send(left_hand_joints.reshape(-1), right_hand_joints.reshape(-1))
+
         smpl_pose_np = (
             latest_data["smpl_pose"].detach().cpu().numpy()[:, :63].reshape(-1, 21, 3)[0]
         ).astype(np.float32)
@@ -1869,10 +1883,12 @@ class PlannerStreamer:
         poll_hz: int = 20,
         zmq_feedback_host: str = "localhost",
         zmq_feedback_port: int = 5557,
+        ftp_ctrl=None,
     ):
         self.socket = socket
         self.reader = reader
         self.three_point = three_point
+        self.ftp_ctrl = ftp_ctrl
         self.feedback_reader = FeedbackReader(
             zmq_feedback_host=zmq_feedback_host, zmq_feedback_port=zmq_feedback_port
         )
@@ -2063,6 +2079,13 @@ class PlannerStreamer:
                         left_hand_position = lh_joints.reshape(-1).astype(np.float32).tolist()
                         right_hand_position = rh_joints.reshape(-1).astype(np.float32).tolist()
 
+            # Send hand joints to FTP hands if enabled
+            if self.ftp_ctrl is not None and left_hand_position is not None:
+                self.ftp_ctrl.send(
+                    np.array(left_hand_position, dtype=np.float32),
+                    np.array(right_hand_position, dtype=np.float32),
+                )
+
             msg = build_planner_message(
                 mode_to_send.value,
                 movement,
@@ -2106,6 +2129,7 @@ def run_pico_manager(
     with_g1_robot: bool = True,
     enable_waist_tracking: bool = False,
     enable_smpl_vis: bool = False,
+    enable_ftp: bool = False,
 ):
     """
     Manager: creates shared PUB socket and runs pose/planner streamers based on current mode.
@@ -2150,6 +2174,17 @@ def run_pico_manager(
         log_prefix="PoseLoop",
     )
 
+    # Initialise Inspire FTP hand controller if requested
+    ftp_ctrl = None
+    if enable_ftp:
+        if InspireFTPController is not None:
+            try:
+                ftp_ctrl = InspireFTPController()
+            except Exception as e:
+                print(f"[Manager] WARNING: FTP controller init failed: {e}")
+        else:
+            print("[Manager] WARNING: --ftp requested but InspireFTPController not available")
+
     pose_streamer = PoseStreamer(
         socket=socket,
         reader=reader,
@@ -2160,6 +2195,7 @@ def run_pico_manager(
         record_dir=record_dir,
         record_format=record_format,
         log_prefix="PoseLoop",
+        ftp_ctrl=ftp_ctrl,
     )
     planner_streamer = PlannerStreamer(
         socket=socket,
@@ -2168,6 +2204,7 @@ def run_pico_manager(
         poll_hz=20,
         zmq_feedback_host=zmq_feedback_host,
         zmq_feedback_port=zmq_feedback_port,
+        ftp_ctrl=ftp_ctrl,
     )
 
     # State machine diagram:
@@ -2357,6 +2394,8 @@ def run_pico_manager(
         print("\nStopping manager...")
     finally:
         # Cleanup resources
+        if ftp_ctrl is not None:
+            ftp_ctrl.stop()
         kbd.stop()
         reader.stop()
         three_point.close()
@@ -2449,6 +2488,11 @@ if __name__ == "__main__":
         action="store_true",
         help="Enable SMPL body joint visualization (24 joint spheres) in the VR3pt viewer",
     )
+    parser.add_argument(
+        "--ftp",
+        action="store_true",
+        help="Enable Inspire FTP hand control via DDS (requires Headless_driver_double.py running on robot)",
+    )
     args = parser.parse_args()
 
     # Standalone VR3Pt test modes (exit after finishing)
@@ -2489,6 +2533,7 @@ if __name__ == "__main__":
             with_g1_robot=with_g1_robot,
             enable_waist_tracking=args.waist_tracking,
             enable_smpl_vis=args.vis_smpl,
+            enable_ftp=args.ftp,
         )
     else:
         # Run legacy single-thread pose streaming
