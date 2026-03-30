@@ -92,9 +92,29 @@ class InspireFTPReader:
             ChannelSubscriber,
         )
 
+        # Import inspire_dds submodule without triggering inspire_sdkpy/__init__.py
+        # (which eagerly imports pymodbus/Qt that may not be installed).
+        import importlib
+        import sys
+        import types
+
+        if "inspire_sdkpy" not in sys.modules:
+            import importlib.util
+
+            spec = importlib.util.find_spec("inspire_sdkpy")
+            if spec is None or spec.submodule_search_locations is None:
+                raise ImportError(
+                    "inspire_sdkpy is required for FTP hand data collection. "
+                    "Make sure the inspire_hand_sdk package is installed or on PYTHONPATH."
+                )
+            pkg = types.ModuleType("inspire_sdkpy")
+            pkg.__path__ = list(spec.submodule_search_locations)
+            pkg.__package__ = "inspire_sdkpy"
+            sys.modules["inspire_sdkpy"] = pkg
+
         try:
-            from inspire_sdkpy import inspire_dds
-        except ImportError as exc:
+            inspire_dds = importlib.import_module("inspire_sdkpy.inspire_dds")
+        except (ImportError, ModuleNotFoundError) as exc:
             raise ImportError(
                 "inspire_sdkpy is required for FTP hand data collection. "
                 "Make sure the inspire_hand_sdk package is installed or on PYTHONPATH."

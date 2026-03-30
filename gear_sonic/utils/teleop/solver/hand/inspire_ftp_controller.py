@@ -78,9 +78,33 @@ class InspireFTPController:
             ChannelSubscriber,
         )
 
+        # Import only the submodules we need (inspire_dds + inspire_hand_defaut).
+        # inspire_sdkpy/__init__.py eagerly imports pymodbus and Qt which may not
+        # be installed, so we register a minimal stub package first to let the
+        # submodule relative imports work without triggering __init__.py.
+        import importlib
+        import sys
+        import types
+
+        if "inspire_sdkpy" not in sys.modules:
+            # Find the package directory on sys.path
+            import importlib.util
+
+            spec = importlib.util.find_spec("inspire_sdkpy")
+            if spec is None or spec.submodule_search_locations is None:
+                raise ImportError(
+                    "inspire_sdkpy is required for FTP hand control. "
+                    "Make sure the inspire_hand_sdk package is installed or on PYTHONPATH."
+                )
+            pkg = types.ModuleType("inspire_sdkpy")
+            pkg.__path__ = list(spec.submodule_search_locations)
+            pkg.__package__ = "inspire_sdkpy"
+            sys.modules["inspire_sdkpy"] = pkg
+
         try:
-            from inspire_sdkpy import inspire_dds, inspire_hand_defaut
-        except ImportError as exc:
+            inspire_dds = importlib.import_module("inspire_sdkpy.inspire_dds")
+            inspire_hand_defaut = importlib.import_module("inspire_sdkpy.inspire_hand_defaut")
+        except (ImportError, ModuleNotFoundError) as exc:
             raise ImportError(
                 "inspire_sdkpy is required for FTP hand control. "
                 "Make sure the inspire_hand_sdk package is installed or on PYTHONPATH."
@@ -89,11 +113,14 @@ class InspireFTPController:
         self._inspire_dds = inspire_dds
         self._inspire_hand_defaut = inspire_hand_defaut
 
-        # Re-initialise DDS so the Inspire hand IDL types are registered
+        # Initialise DDS domain (no interface arg = auto-detect, same as xr_teleoperate).
+        # In SONIC the C++ deploy runs DDS in a separate process, so this Python
+        # process needs its own DDS domain for the Inspire FTP topics.
         try:
-            ChannelFactoryInitialize(0, "")
-        except Exception:
-            pass
+            ChannelFactoryInitialize(0)
+            print("[InspireFTP] DDS domain initialised")
+        except Exception as e:
+            print(f"[InspireFTP] DDS init note: {e} (may already be initialised)")
 
         # Publishers
         self._pub_left = ChannelPublisher(kTopicInspireCtrlLeft, inspire_dds.inspire_hand_ctrl)
@@ -141,6 +168,8 @@ class InspireFTPController:
 
     def send(self, left_joints_7: np.ndarray, right_joints_7: np.ndarray):
         """Convert pipeline joint arrays and publish FTP commands."""
+        if self._log_counter == 0:
+            print(f"[InspireFTP] First send() call — L_pipeline={left_joints_7[:6]}  R_pipeline={right_joints_7[:6]}")
         left_cmd = _pipeline_to_ftp_cmd(left_joints_7)
         right_cmd = _pipeline_to_ftp_cmd(right_joints_7)
 
